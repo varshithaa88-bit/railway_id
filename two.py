@@ -447,32 +447,17 @@ def schedule_delete(path: str, after_seconds: int = None):
     log.info("[pdf-lifecycle] scheduled delete: %s in %ds", path, after_seconds)
 
 
-def _delete_now(path: str) -> bool:
-    """Attempt to delete *path*.  Returns True on success, False if the file
-    is still locked (e.g. WinError 32 on Windows) so the caller can retry."""
+def _delete_now(path: str):
     try:
         if path and os.path.exists(path):
             os.unlink(path)
             log.info("[pdf-lifecycle] deleted: %s", path)
-        return True          # file gone (either deleted or never existed)
     except Exception as e:
-        log.warning("[pdf-lifecycle] delete failed (will retry): %s: %s", path, e)
-        return False         # still locked — caller must reschedule
+        log.warning("[pdf-lifecycle] delete failed: %s: %s", path, e)
 
 
 def _reaper_loop():
-    """Background thread — sweeps expired files every 30 seconds.
-
-    FIX (WinError 32 / file-lock bug):
-      Previously the path was removed from _pending_deletes *before* the
-      delete was attempted.  If os.unlink() raised (file still open on
-      Windows), the path was silently dropped and never retried — causing
-      temp-file leaks and the WinError 32 spam in the log.
-
-      Now: the path is only removed when deletion succeeds.  On failure it
-      is rescheduled 60 s into the future so the reaper retries automatically
-      once the file handle is released by the OS.
-    """
+    """Background thread — sweeps expired files every 30 seconds."""
     while True:
         try:
             now = time.time()
@@ -481,15 +466,9 @@ def _reaper_loop():
                 for p, t in list(_pending_deletes.items()):
                     if t <= now:
                         expired.append(p)
-            for p in expired:
-                if _delete_now(p):
-                    # Success — remove from the scheduler
-                    with _pending_lock:
                         _pending_deletes.pop(p, None)
-                else:
-                    # Deletion failed (file still locked) — reschedule in 60 s
-                    with _pending_lock:
-                        _pending_deletes[p] = time.time() + 60
+            for p in expired:
+                _delete_now(p)
             # opportunistic: prune stale jobs while we're here
             _prune_old_jobs()
         except Exception:
@@ -502,7 +481,7 @@ threading.Thread(target=_reaper_loop, daemon=True, name="pdf-reaper").start()
 MAX_UPLOAD_MB             = int(os.environ.get("MAX_UPLOAD_MB", "12"))
 MAX_STUDENTS_PER_REQUEST  = int(os.environ.get("MAX_STUDENTS_PER_REQUEST", "2000"))
 PREVIEW_DPI               = int(os.environ.get("PREVIEW_DPI", "150"))
-DOWNLOAD_DPI              = int(os.environ.get("DOWNLOAD_DPI", "300"))
+DOWNLOAD_DPI              = int(os.environ.get("DOWNLOAD_DPI", "150"))
 # ⏱  Photo timeouts — connect 6s, read 12s. titusattendence.com can be slow.
 PHOTO_TIMEOUT             = (6, 12)
 MAX_PHOTO_BYTES           = int(os.environ.get("MAX_PHOTO_BYTES", str(4 * 1024 * 1024)))
@@ -528,8 +507,8 @@ except Exception:
 
 # 📷  Quality: production uses smaller photos to save RAM; local uses higher quality.
 # At ID-card print size (~16 mm wide), 200 px is visually identical to 360 px.
-PHOTO_PX           = int(os.environ.get("PHOTO_PX", "360" if _IS_PRODUCTION else "480"))
-PHOTO_JPEG_QUALITY = int(os.environ.get("PHOTO_JPEG_QUALITY", "90" if _IS_PRODUCTION else "92"))
+PHOTO_PX           = int(os.environ.get("PHOTO_PX", "200" if _IS_PRODUCTION else "240"))
+PHOTO_JPEG_QUALITY = int(os.environ.get("PHOTO_JPEG_QUALITY", "72" if _IS_PRODUCTION else "80"))
 
 # 🧠  Memory caps: production must stay under ~350 MB working set
 MAX_CACHED_PHOTOS   = int(os.environ.get("MAX_CACHED_PHOTOS",  "60"  if _IS_PRODUCTION else "600"))
@@ -1156,7 +1135,7 @@ def check_session_gating():
     path = request.path
     is_public = False
     
-    if path in ("/", "/health", "/api/system/stats", "/system/stats", "/api/login", "/login", "/api/templates", "/templates", "/api/employees/templates", "/employees/templates"):
+    if path in ("/", "/health", "/api/system/stats", "/system/stats", "/api/login", "/login", "/api/templates", "/templates"):
         is_public = True
     elif (path.startswith("/api/templates/") or path.startswith("/templates/")) and path.endswith("/preview.png"):
         is_public = True
@@ -1694,15 +1673,32 @@ def _compress_photo(pil_img) -> bytes:
     if src_min < 280:
         rgb = rgb.filter(ImageFilter.SMOOTH)
 
-    # Resize to fit within PHOTO_PX on the longest side — NO white canvas.
-    # Preserving the original aspect ratio here is critical: prepare_photo_for_rect_cover
-    # later applies true COVER (fill + center-crop) to match the card placeholder exactly.
-    # If we bake a white square canvas here, those white bars become part of the image
-    # data and survive the COVER step, causing visible white space on the card.
-    ratio = min(PHOTO_PX / max(1, src_w), PHOTO_PX / max(1, src_h))
-    new_w = max(1, int(round(src_w * ratio)))
-    new_h = max(1, int(round(src_h * ratio)))
-    resized = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    # ✅ v3.0 SMART PHOTO FIT (per user spec):
+    #   • Portrait or roughly-square source → COVER (center-crop, 100% fill,
+    #     no white space).  ID-card photo placeholders are typically taller
+    #     than wide, so a portrait headshot will fully fill the box.
+    #   • Landscape source                  → CONTAIN (letterbox, preserves
+    #     the whole photo) so a wide group/landscape photo isn't cropped.
+    is_landscape = src_w > src_h * 1.10
+    if is_landscape:
+        fitted = ImageOps.contain(rgb, (PHOTO_PX, PHOTO_PX),
+                                  method=Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (PHOTO_PX, PHOTO_PX), (255, 255, 255))
+        fx = (PHOTO_PX - fitted.size[0]) // 2
+        fy = (PHOTO_PX - fitted.size[1]) // 2
+        canvas.paste(fitted, (fx, fy))
+        fitted.close()
+        resized = canvas
+    else:
+        # COVER: shorter side scales to PHOTO_PX, then center-crop.
+        ratio = max(PHOTO_PX / max(1, src_w), PHOTO_PX / max(1, src_h))
+        new_w = max(1, int(round(src_w * ratio)))
+        new_h = max(1, int(round(src_h * ratio)))
+        scaled = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        left = max(0, (new_w - PHOTO_PX) // 2)
+        top  = max(0, (new_h - PHOTO_PX) // 2)
+        resized = scaled.crop((left, top, left + PHOTO_PX, top + PHOTO_PX))
+        scaled.close()
     if rgb is not pil_img:
         rgb.close()
 
@@ -2018,45 +2014,41 @@ def insert_image_safe(page, rect, photo_bytes):
 
 def prepare_photo_for_rect_cover(photo_bytes, rect_coords, scale=6, output_format="JPEG", is_redeemer=False):
     """
-    TRUE COVER — scales image so it fully fills the placeholder in BOTH
-    dimensions, then center-crops the excess. Zero white space, no distortion.
-
-    IMPORTANT: rect_coords must be the ACTUAL inserted rect coords (after any
-    map_rect / _tr_rect transform), not raw template coords. If you pass raw
-    template coords and the transform has sx != sy, the prepared image will have
-    the wrong aspect ratio and white bars will appear.
+    v3.1 photo stretching and customized Redeemer top/bottom crop.
     """
     if not HAS_PIL or not photo_bytes:
         return photo_bytes
     x0, y0, x1, y1 = rect_coords
-    target_w = max(1, int(round(abs(x1 - x0) * scale)))
-    target_h = max(1, int(round(abs(y1 - y0) * scale)))
+    target_w = max(1, int(round((x1 - x0) * scale)))
+    target_h = max(1, int(round((y1 - y0) * scale)))
     try:
         with Image.open(io.BytesIO(photo_bytes)) as img:
             try: img = ImageOps.exif_transpose(img)
             except Exception: pass
             rgb = img.convert("RGB")
             src_w, src_h = rgb.size
+            
+            if is_redeemer:
+                # Redeemer: crop 12% off the top and 12% off the bottom of the original photo
+                crop_h = int(src_h * 0.12)
+                cropped = rgb.crop((0, crop_h, src_w, src_h - crop_h))
+            else:
+                # All other schools/employees: whole photo shown with top and bottom fully (no cropping at all)
+                cropped = rgb
 
-            # COVER: scale so the image fills the ENTIRE placeholder in both
-            # width and height, then crop the centre — no white space at all.
-            ratio = max(target_w / max(1, src_w), target_h / max(1, src_h))
-            new_w = max(1, int(round(src_w * ratio)))
-            new_h = max(1, int(round(src_h * ratio)))
-            fitted = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-            left = (new_w - target_w) // 2
-            top  = (new_h - target_h) // 2
-            fitted = fitted.crop((left, top, left + target_w, top + target_h))
+            # Stretch to fit target_w, target_h fully (no white space)
+            canvas = cropped.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            if cropped is not rgb:
+                cropped.close()
 
             buf = io.BytesIO()
             save_fmt = (output_format or "JPEG").upper()
             if save_fmt == "JPEG":
-                fitted.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY,
+                canvas.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY,
                             optimize=True, progressive=False, subsampling=1)
             else:
-                fitted.save(buf, format="PNG")
-            fitted.close()
+                canvas.save(buf, format="PNG")
+            canvas.close()
             if rgb is not img:
                 rgb.close()
             return buf.getvalue()
@@ -2109,14 +2101,18 @@ def prepare_photo_for_rect_contain(photo_bytes, rect_coords, scale=6, output_for
 
 def prepare_photo_for_rect(photo_bytes, rect_coords, scale=6, output_format="JPEG"):
     """
-    TRUE COVER — scales image so it fully fills the placeholder in BOTH
-    dimensions, then center-crops the excess. Zero white space, no distortion.
+    v3.0 SMART PHOTO FIT (per-rect aspect-aware):
+      • If both source AND target rect are portrait/square → COVER
+        (center-crop, 100% fill, NO white space — fixes the issue where
+        portrait photos had visible white pillars on left/right).
+      • If either source OR target is clearly landscape → CONTAIN
+        (letterbox on white) so wide photos aren't cropped.
     """
     if not HAS_PIL or not photo_bytes:
         return photo_bytes
     x0, y0, x1, y1 = rect_coords
-    target_w = max(1, int(round(abs(x1 - x0) * scale)))
-    target_h = max(1, int(round(abs(y1 - y0) * scale)))
+    target_w = max(1, int(round((x1 - x0) * scale)))
+    target_h = max(1, int(round((y1 - y0) * scale)))
     try:
         with Image.open(io.BytesIO(photo_bytes)) as img:
             try: img = ImageOps.exif_transpose(img)
@@ -2124,23 +2120,37 @@ def prepare_photo_for_rect(photo_bytes, rect_coords, scale=6, output_format="JPE
             rgb = img.convert("RGB")
             src_w, src_h = rgb.size
 
-            ratio = max(target_w / max(1, src_w), target_h / max(1, src_h))
-            new_w = max(1, int(round(src_w * ratio)))
-            new_h = max(1, int(round(src_h * ratio)))
-            fitted = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            target_is_landscape = target_w > target_h * 1.10
+            source_is_landscape = src_w   > src_h   * 1.10
+            use_cover = not (target_is_landscape or source_is_landscape)
 
-            left = (new_w - target_w) // 2
-            top  = (new_h - target_h) // 2
-            fitted = fitted.crop((left, top, left + target_w, top + target_h))
+            if use_cover:
+                ratio = max(target_w / max(1, src_w),
+                            target_h / max(1, src_h))
+                new_w = max(1, int(round(src_w * ratio)))
+                new_h = max(1, int(round(src_h * ratio)))
+                scaled = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                left = max(0, (new_w - target_w) // 2)
+                top  = max(0, (new_h - target_h) // 2)
+                canvas = scaled.crop((left, top, left + target_w, top + target_h))
+                scaled.close()
+            else:
+                fitted = ImageOps.contain(rgb, (target_w, target_h),
+                                          method=Image.Resampling.LANCZOS)
+                canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+                fx = (target_w - fitted.size[0]) // 2
+                fy = (target_h - fitted.size[1]) // 2
+                canvas.paste(fitted, (fx, fy))
+                fitted.close()
 
             buf = io.BytesIO()
             save_fmt = (output_format or "JPEG").upper()
             if save_fmt == "JPEG":
-                fitted.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY,
+                canvas.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY,
                             optimize=True, progressive=False, subsampling=1)
             else:
-                fitted.save(buf, format="PNG")
-            fitted.close()
+                canvas.save(buf, format="PNG")
+            canvas.close()
             if rgb is not img:
                 rgb.close()
             return buf.getvalue()
@@ -2311,15 +2321,13 @@ def _draw_redeemer_overlay_core(page, student: dict, map_point, map_rect, scale_
         map_rect(REDEEMER_PHOTO_OUTER_RECT),
         color=REDEEMER_WHITE, fill=REDEEMER_WHITE, width=0, overlay=True,
     )
-    _redeemer_photo_rect = map_rect(REDEEMER_PHOTO_RECT_COORDS)
     photo_bytes = prepare_photo_for_rect_cover(
         fetch_photo_bytes(student.get("photo_url", "")),
-        (_redeemer_photo_rect.x0, _redeemer_photo_rect.y0,
-         _redeemer_photo_rect.x1, _redeemer_photo_rect.y1),
+        REDEEMER_PHOTO_RECT_COORDS,
         scale=PHOTO_EMBED_SCALE, output_format="JPEG",
         is_redeemer=True,
     )
-    insert_image_safe(page, _redeemer_photo_rect, photo_bytes)
+    insert_image_safe(page, map_rect(REDEEMER_PHOTO_RECT_COORDS), photo_bytes)
     page.draw_rect(
         map_rect(REDEEMER_PHOTO_OUTER_RECT),
         color=REDEEMER_BLACK, fill=None, width=max(0.1, REDEEMER_PHOTO_BORDER_W * ((scale_x + scale_y) / 2.0)), overlay=True,
@@ -2557,14 +2565,12 @@ def draw_card_overlay_hebron(page, student: dict, tr):
 
     redraw_blood_teardrop_transformed(page, tr, BLOOD_RED)
 
-    _hebron_photo_rect = _tr_rect(tr, PHOTO_RECT_COORDS)
     photo_bytes = prepare_photo_for_rect_cover(
         fetch_photo_bytes(student.get("photo_url", "")),
-        (_hebron_photo_rect.x0, _hebron_photo_rect.y0,
-         _hebron_photo_rect.x1, _hebron_photo_rect.y1),
+        PHOTO_RECT_COORDS,
         scale=PHOTO_EMBED_SCALE, output_format="JPEG",
     )
-    insert_image_safe(page, _hebron_photo_rect, photo_bytes)
+    insert_image_safe(page, _tr_rect(tr, PHOTO_RECT_COORDS), photo_bytes)
 
     draw_text_vertically_centered(
         page, _tr_rect(tr, NAME_TEXT_RECT_COORDS),
@@ -2829,7 +2835,7 @@ def _render_priyanka_card_bytes(student: dict, tmpl_bytes: bytes):
 
     buf = io.BytesIO()
     try:
-        doc.save(buf, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True, incremental=False)
+        doc.save(buf, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True, use_objstms=1, incremental=False)
     except TypeError:
         doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
     doc.close()
@@ -3053,7 +3059,7 @@ def _render_ab_ascent_card_bytes(student: dict, tmpl_bytes: bytes):
 
     buf = io.BytesIO()
     try:
-        doc.save(buf, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True, incremental=False)
+        doc.save(buf, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True, use_objstms=1, incremental=False)
     except TypeError:
         doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
     doc.close()
@@ -3269,7 +3275,7 @@ def _render_hebron_emp_card_bytes(student: dict, tmpl_bytes: bytes):
     buf = io.BytesIO()
     try:
         doc.save(buf, garbage=4, deflate=True, deflate_images=True,
-                 deflate_fonts=True, clean=True, incremental=False)
+                 deflate_fonts=True, clean=True, use_objstms=1, incremental=False)
     except TypeError:
         doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
     doc.close()
@@ -3519,7 +3525,7 @@ def _render_ab_ascent_emp_card_bytes(student: dict, tmpl_bytes: bytes):
     buf = io.BytesIO()
     try:
         doc.save(buf, garbage=4, deflate=True, deflate_images=True,
-                 deflate_fonts=True, clean=True, incremental=False)
+                 deflate_fonts=True, clean=True, use_objstms=1, incremental=False)
     except TypeError:
         doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
     doc.close()
@@ -3664,7 +3670,7 @@ def _render_redeemer_emp_card_bytes(student: dict, tmpl_bytes: bytes):
     buf = io.BytesIO()
     try:
         doc.save(buf, garbage=4, deflate=True, deflate_images=True,
-                 deflate_fonts=True, clean=True, incremental=False)
+                 deflate_fonts=True, clean=True, use_objstms=1, incremental=False)
     except TypeError:
         doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
     doc.close()
@@ -3855,7 +3861,7 @@ def _render_priyanka_emp_card_bytes(student: dict, tmpl_bytes: bytes):
     buf = io.BytesIO()
     try:
         doc.save(buf, garbage=4, deflate=True, deflate_images=True,
-                 deflate_fonts=True, clean=True, incremental=False)
+                 deflate_fonts=True, clean=True, use_objstms=1, incremental=False)
     except TypeError:
         doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
     doc.close()
@@ -4096,7 +4102,7 @@ def _render_a4_page(out_doc, page_idx: int, students: list,
 _PDF_SAVE_OPTS = dict(
     deflate=True, deflate_images=True, deflate_fonts=True,
     garbage=4, clean=True, linear=False, incremental=False,
-    pretty=False,
+    use_objstms=1, pretty=False,
 )
 
 
@@ -4266,21 +4272,6 @@ def build_pdf_file_vector(students: list, template_key: str = DEFAULT_TEMPLATE,
                     gc.collect()
                     merger = fitz.open(compaction_tmp)
 
-            # ── SET METADATA on the final merged PDF ─────────────────
-            # This is the ONLY place metadata needs to be set.
-            # Per-card renderer metadata is discarded (cards are pasted
-            # as images via show_pdf_page onto the A4 out_doc).
-            try:
-                cfg = TEMPLATE_CONFIGS.get(template_key, {})
-                school_name = cfg.get("display_name", "ID Card Generator")
-                merger.set_metadata({
-                    "title":    f"{school_name} — ID Cards",
-                    "author":   school_name,
-                    "producer": "ID Card Generator",
-                    "creator":  "ID Card Generator",
-                })
-            except Exception as _meta_err:
-                log.warning("set_metadata failed (non-fatal): %s", _meta_err)
             _safe_save(merger, out_path)
         finally:
             try: merger.close()
@@ -4459,38 +4450,45 @@ def send_generated_pdf(students, dpi, download_name, as_attachment, allow_extern
 
     log.info("Sending PDF to client: %s  attachment=%s", download_name, as_attachment)
 
+    # ✅ Use Flask's send_file with a known disk path + @after_this_request to
+    # delete AFTER the response is fully written. This is more reliable than
+    # a streaming generator (which can be cut short by proxies on slow links).
     safe_name = _sanitize_filename(download_name)
 
-    # Schedule the delayed delete BEFORE reading so the reaper knows about
-    # the file even if this request dies partway through.
-    schedule_delete(pdf_path, PDF_RETENTION_SECONDS)
+    # v2.8: instead of unlinking the file the instant the response finishes,
+    # schedule a delete in 5 minutes. This makes range-request resumes and
+    # client-side retries reliable on slow connections, and prevents the
+    # "Network Error — PDF generated but deleted" race users were hitting.
+    @after_this_request
+    def _cleanup(response):
+        schedule_delete(pdf_path, PDF_RETENTION_SECONDS)
+        gc.collect()
+        return response
 
-    # Same fix as job_file: read into bytes first so the file handle is
-    # released immediately (no WinError 32), then return a plain bytes
-    # Response with a single correct Content-Length header.
-    # A generator Response would trigger Transfer-Encoding: chunked which
-    # conflicts with Content-Length → axios "Network Error".
     try:
-        with open(pdf_path, "rb") as fh:
-            pdf_bytes = fh.read()
-    except OSError as e:
-        log.error("Could not read PDF file: %s", e)
-        return jsonify({"error": "PDF file missing after generation"}), 500
-
-    gc.collect()
-
-    from flask import Response as _Response
-    disp = ("attachment" if as_attachment else "inline") + f'; filename="{safe_name}"'
-    resp = _Response(
-        pdf_bytes,
-        status=200,
-        mimetype="application/pdf",
-    )
-    resp.headers["Content-Disposition"] = disp
-    resp.headers["Content-Length"]      = str(len(pdf_bytes))
-    resp.headers["X-Accel-Buffering"]   = "no"
-    resp.headers["Cache-Control"]       = "no-store"
-    return resp
+        resp = send_file(
+            pdf_path,
+            mimetype="application/pdf",
+            as_attachment=as_attachment,
+            download_name=safe_name,
+            conditional=True,        # supports Range requests / resume
+            max_age=0,
+        )
+        # Make sure proxies don't truncate / buffer
+        resp.headers["Content-Disposition"] = (
+            ("attachment" if as_attachment else "inline") +
+            f'; filename="{safe_name}"'
+        )
+        resp.headers["X-Accel-Buffering"] = "no"
+        resp.headers["Cache-Control"]    = "no-store"
+        resp.headers.pop("Date", None)
+        return resp
+    except Exception as e:
+        log.error("send_file failed: %s", e)
+        # On send_file error, still keep file alive briefly so the client
+        # can re-try the download (e.g. via /api/jobs/<id>/file).
+        schedule_delete(pdf_path, 120)
+        return jsonify({"error": f"send_file failed: {e}"}), 500
 
 # ─────────────────────────────────────────────────────────────────
 # TEMPLATE API
@@ -4902,112 +4900,43 @@ def job_progress(jid):
     })
 
 
-@app.route("/api/jobs/<jid>/debug-info", methods=["GET"])
-def job_debug_info(jid):
-    """Debug endpoint — open in browser to inspect job state.
-    GET http://localhost:5000/api/jobs/<jid>/debug-info
-    """
-    j = _job_get(jid)
-    if not j:
-        return jsonify({"error": "unknown job", "jid": jid}), 404
-    path = j.get("file_path")
-    info = {
-        "jid":           jid,
-        "status":        j.get("status"),
-        "phase":         j.get("phase"),
-        "progress":      j.get("progress"),
-        "file_path":     path,
-        "file_size_kb":  round(j.get("file_size", 0) / 1024, 1),
-        "download_name": j.get("download_name"),
-        "error":         j.get("error"),
-        "file_exists_on_disk": bool(path and os.path.exists(path)),
-    }
-    if path and os.path.exists(path):
-        try:
-            disk_size = os.path.getsize(path)
-            info["disk_size_bytes"] = disk_size
-            info["disk_size_kb"]    = round(disk_size / 1024, 1)
-            with open(path, "rb") as fh:
-                header = fh.read(16)
-            info["first_16_bytes_hex"] = header.hex()
-            info["is_valid_pdf"]       = header[:4] == b"%PDF"
-        except Exception as e:
-            info["disk_read_error"] = str(e)
-    safe_name = _sanitize_filename(j.get("download_name") or "ids.pdf")
-    info["response_headers_that_will_be_sent"] = {
-        "Content-Type":        "application/pdf",
-        "Content-Disposition": f'attachment; filename="{safe_name}"',
-        "Content-Length":      str(j.get("file_size", "?")),
-        "Cache-Control":       "no-store",
-    }
-    log.info("[DOWNLOAD-DEBUG] debug-info for job %s: %s", jid, json.dumps(info, default=str))
-    return jsonify(info)
-
-
 @app.route("/api/jobs/<jid>/file", methods=["GET"])
 def job_file(jid):
-    # Log every incoming request header so we can see exactly what axios is sending
-    log.info("[DOWNLOAD-DEBUG] >>>>>>>>>> /jobs/%s/file HIT <<<<<<<<<<<", jid)
-    log.info("[DOWNLOAD-DEBUG]   User-Agent      : %s", request.headers.get("User-Agent", "<none>"))
-    log.info("[DOWNLOAD-DEBUG]   Accept          : %s", request.headers.get("Accept", "<none>"))
-    log.info("[DOWNLOAD-DEBUG]   Range           : %s", request.headers.get("Range", "<none>"))
-    log.info("[DOWNLOAD-DEBUG]   Origin          : %s", request.headers.get("Origin", "<none>"))
-    log.info("[DOWNLOAD-DEBUG]   X-Requested-With: %s", request.headers.get("X-Requested-With", "<none>"))
-
     j = _job_get(jid)
     if not j:
-        log.warning("[DOWNLOAD-DEBUG] job %s NOT FOUND in registry", jid)
         return jsonify({"error": "unknown job"}), 404
-
-    log.info("[DOWNLOAD-DEBUG]   job.status    : %s", j["status"])
-    log.info("[DOWNLOAD-DEBUG]   job.file_path : %s", j["file_path"])
-    log.info("[DOWNLOAD-DEBUG]   job.file_size : %.1f KB", j.get("file_size", 0) / 1024)
-
     if j["status"] != "done":
-        log.warning("[DOWNLOAD-DEBUG] job not done yet — returning 409")
         return jsonify({"error": f"job not finished: {j['status']}", "phase": j["phase"],
                         "progress": j["progress"]}), 409
-
     path = j["file_path"]
     if not path or not os.path.exists(path):
-        log.error("[DOWNLOAD-DEBUG] FILE MISSING ON DISK: %s", path)
         return jsonify({"error": "file expired or missing"}), 410
 
     safe_name = _sanitize_filename(j["download_name"] or "ids.pdf")
-    log.info("[DOWNLOAD-DEBUG]   safe_name     : %s", safe_name)
 
-    # Schedule delete before reading so reaper knows about the file
-    schedule_delete(path, PDF_RETENTION_SECONDS)
-    log.info("[pdf-lifecycle] /jobs/%s/file served — file retained for %ds", jid, PDF_RETENTION_SECONDS)
+    @after_this_request
+    def _cleanup(response):
+        # v2.8: schedule delete in 5 min instead of unlinking immediately.
+        # The job record is also kept for the same retention window so the
+        # client can resume or retry the download.
+        schedule_delete(path, PDF_RETENTION_SECONDS)
+        log.info("[pdf-lifecycle] /jobs/%s/file served — file retained for %ds",
+                 jid, PDF_RETENTION_SECONDS)
+        gc.collect()
+        return response
 
-    # Read entire file into RAM — closes handle immediately (no WinError 32).
-    # Plain bytes Response = single Content-Length, NO Transfer-Encoding: chunked.
-    try:
-        with open(path, "rb") as fh:
-            pdf_bytes = fh.read()
-        log.info("[DOWNLOAD-DEBUG]   bytes_read    : %d (%.1f KB)", len(pdf_bytes), len(pdf_bytes)/1024)
-        log.info("[DOWNLOAD-DEBUG]   is_valid_pdf  : %s", pdf_bytes[:4] == b"%PDF")
-    except OSError as e:
-        log.error("[DOWNLOAD-DEBUG] FAILED TO READ FILE INTO RAM: %s", e)
-        return jsonify({"error": "file expired or missing"}), 410
-
-    gc.collect()
-
-    from flask import Response as _Response
-    resp = _Response(pdf_bytes, status=200, mimetype="application/pdf")
+    resp = send_file(path,
+                     mimetype="application/pdf",
+                     as_attachment=True,
+                     download_name=safe_name,
+                     conditional=True,
+                     max_age=0)
     resp.headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
-    resp.headers["Content-Length"]      = str(len(pdf_bytes))
     resp.headers["X-Accel-Buffering"]   = "no"
     resp.headers["Cache-Control"]       = "no-store"
-
-    log.info("[DOWNLOAD-DEBUG] <<<<<<<<<< RESPONSE BEING SENT:")
-    log.info("[DOWNLOAD-DEBUG]   Status          : 200 OK")
-    log.info("[DOWNLOAD-DEBUG]   Content-Type    : application/pdf")
-    log.info("[DOWNLOAD-DEBUG]   Content-Length  : %d bytes", len(pdf_bytes))
-    log.info("[DOWNLOAD-DEBUG]   Content-Disp    : attachment; filename=\"%s\"", safe_name)
-    log.info("[DOWNLOAD-DEBUG] === IF THE CLIENT RETRIES AFTER THIS, THE BUG IS IN THE FRONTEND ===")
-
+    resp.headers.pop("Date", None)
     return resp
+
 
 @app.route("/api/jobs/<jid>", methods=["DELETE"])
 def job_cancel(jid):
@@ -5560,15 +5489,5 @@ _startup_log()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    # FIX: debug=False prevents the Werkzeug auto-reloader from restarting
-    # the process mid-transfer.  The reloader watches .py files and when it
-    # detects a change it kills the server process, which immediately drops
-    # ALL open socket connections — including large PDF downloads that are
-    # still streaming.  Users on slow links or with large PDFs (50+ MB) see
-    # this as a "Network Error" even though the server logged "200 OK"
-    # (the status line was sent before the connection was dropped).
-    #
-    # For interactive development with auto-reload, set DEBUG_RELOAD=1 in
-    # the environment explicitly; otherwise leave it off.
-    _debug = os.environ.get("DEBUG_RELOAD", "0").strip() in ("1", "true", "yes")
+    # threaded=True → multiple in-flight requests don't block each other
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True)
