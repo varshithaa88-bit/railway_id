@@ -15,3 +15,9 @@ build/
 *.log
 /tmp/
 node_modules/
+backup.py
+backup2.py
+four.py
+code_for_new_school.py
+README_MODULAR.md
+testcard_readme.md
