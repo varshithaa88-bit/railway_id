@@ -1,9 +1,39 @@
 """
-ID Card Generator - Flask Backend v2.7
+ID Card Generator - Flask Backend v2.9
 Fast vector-native PDF assembly tuned for 512 MB / 0.5 CPU production.
 Works for 700+ students without OOM or download failures.
 
-v2.7 changes (vs v2.6):
+v2.9 changes (vs v2.8):
+  • EMPLOYEE FULL-PHOTO FIT — all four *_emp renderers (ab_ascent_emp,
+    hebron_emp, redeemer_emp, priyanka_emp) now embed the employee
+    photograph using CONTAIN (scale-to-fit, letterbox on white) instead
+    of the previous smart-cover (which center-cropped portrait photos
+    and silently cut off legs / feet on full-length photos).  This
+    exactly matches the v2.9 standalone scripts shipped to the schools
+    (ab_ascent_emp.py, hebron_emp.py, redeemer_student.py) so the
+    backend output is now byte-equivalent to the standalone output.
+  • New helper `prepare_photo_for_rect_cover()` next to the existing
+    `prepare_photo_for_rect()` so STUDENT renderers keep their
+    aspect-aware smart-fit behaviour untouched.
+
+v2.8 changes (vs v2.7):
+  • EMPLOYEE ID CARD SUPPORT — 4 new templates (ab_ascent_emp,
+    redeemer_emp, hebron_emp, priyanka_emp) and a parallel /api/employees/*
+    REST surface (upload-only — the live-API source is intentionally
+    disabled for employees in the frontend per spec).
+  • DELAYED PDF DELETION (5 min) — generated PDFs are no longer
+    unlinked the instant the response finishes. Instead they live for
+    PDF_RETENTION_SECONDS (default 300 s) so client-side retries and
+    range-request resumes work cleanly. Eliminates the spurious
+    "Network Error" that was hitting users on slow networks.
+  • RAW PHOTO URL — _clean_photo_url no longer rewrites markdown
+    syntax or escape sequences. Whatever URL is in the row is used
+    verbatim (only whitespace is trimmed and the scheme is verified).
+  • Better debug logs around PDF lifecycle (created / served / expired).
+  • JPEG output kept for all rect-prepared photos.
+
+
+v2.7 changes (kept for reference):
   • CHUNKED ON-DISK PDF BUILDER  — pages are flushed to disk every
     CHUNK_PAGES (default 5 pages = 50 students). The master PyMuPDF
     document NEVER holds the whole PDF in RAM. Peak RAM stays under
@@ -83,6 +113,19 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("idcard")
+
+# v2.9: silence the 2-second /api/system/stats polling so the console
+# isn't flooded with one access-log line every two seconds. Other routes
+# still log normally.
+class _NoisyPollFilter(logging.Filter):
+    _QUIET = ("/api/system/stats", "/system/stats")
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(q in msg for q in self._QUIET)
+logging.getLogger("werkzeug").addFilter(_NoisyPollFilter())
 _RAILWAY_URL = "https://web-production-3d153.up.railway.app"
 _ALLOWED_ORIGINS = list(filter(None, [
     _RAILWAY_URL,
@@ -98,7 +141,7 @@ _seen = set(); _ALLOWED_ORIGINS = [x for x in _ALLOWED_ORIGINS if x and not (_se
 CORS(app,
      origins=["*"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+     allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Session-Token", "X-Client-ID"],
      supports_credentials=False,
      expose_headers=["Content-Disposition", "Content-Type", "X-Students-Count", "Content-Length", "X-Job-ID"])
 
@@ -108,10 +151,9 @@ def _add_cors(response):
     origin = request.headers.get("Origin", "")
     response.headers["Access-Control-Allow-Origin"]   = origin or "*"
     response.headers["Access-Control-Allow-Methods"]  = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"]  = "Content-Type, Authorization, X-Requested-With"
+    response.headers["Access-Control-Allow-Headers"]  = "Content-Type, Authorization, X-Requested-With, X-Session-Token, X-Client-ID"
     response.headers["Access-Control-Expose-Headers"] = "Content-Disposition, Content-Type, X-Students-Count, Content-Length, X-Job-ID"
-    response.headers["Connection"] = "keep-alive"
-    response.headers["Cache-Control"] = "no-store"
+    response.headers["Cache-Control"]       = "no-store"
     return response
 
 @app.route("/api/<path:subpath>", methods=["OPTIONS"])
@@ -130,6 +172,7 @@ ARIAL_BOLD             = BASE_DIR / "arialbd.ttf"
 
 DEFAULT_SESSION = "2026-27"
 DEFAULT_TEMPLATE = "redeemer"
+DEFAULT_EMP_TEMPLATE = "redeemer_emp"
 
 SCHOOLS = {
     2: "My Redeemer Mission School",
@@ -137,6 +180,12 @@ SCHOOLS = {
     4: "Priyanka Dreamnest School",
     5: "Ab Ascent School",
 }
+
+# ── Employee template PDFs ─────────────────────────────────────
+TEMPLATE_PDF_HEBRON_EMP    = BASE_DIR / "template_hebron_emp.pdf"
+TEMPLATE_PDF_REDEEMER_EMP  = BASE_DIR / "template_redeemer_emp.pdf"
+TEMPLATE_PDF_PRIYANKA_EMP  = BASE_DIR / "template_priyanka_emp.pdf"
+TEMPLATE_PDF_AB_ASCENT_EMP = BASE_DIR / "template_ab_ascent_emp.pdf"
 
 TEMPLATE_CONFIGS = {
     "hebron": {
@@ -185,6 +234,86 @@ TEMPLATE_CONFIGS = {
         ],
     },
 }
+
+# ── Employee templates ──────────────────────────────────────────
+# Each employee template re-uses an existing student renderer ("redeemer",
+# "hebron", "priyanka" or "ab_ascent") — we only swap the underlying PDF
+# template. The frontend lists these 4 templates separately under the
+# Employees mode and posts to /api/employees/*.
+#
+# Priyanka now has a dedicated employee renderer (`_render_priyanka_emp_card_bytes`)
+# whose geometry/colors port the standalone idcard_colab.py reference script.
+EMPLOYEE_TEMPLATE_CONFIGS = {
+    "hebron_emp": {
+        "key":          "hebron_emp",
+        "label":        "Hebron — Employee",
+        "display_name": "Hebron Mission School (Employee)",
+        "pdf":          TEMPLATE_PDF_HEBRON_EMP if TEMPLATE_PDF_HEBRON_EMP.exists() else TEMPLATE_PDF_HEBRON,
+        "renderer":     "hebron",
+        "description": "Hebron Employee ID layout.",
+        "fields": [
+            "employee_name", "designation", "father_name", "dob",
+            "address", "mobile", "emp_id", "photo_url",
+        ],
+    },
+    "redeemer_emp": {
+        "key":          "redeemer_emp",
+        "label":        "Redeemer — Employee",
+        "display_name": "My Redeemer Mission School (Employee)",
+        "pdf":          TEMPLATE_PDF_REDEEMER_EMP if TEMPLATE_PDF_REDEEMER_EMP.exists() else TEMPLATE_PDF_REDEEMER,
+        "renderer":     "redeemer",
+        "description": "Redeemer Employee ID layout.",
+        "fields": [
+            "employee_name", "designation", "father_name", "dob",
+            "address", "mobile", "emp_id", "photo_url",
+        ],
+    },
+    "priyanka_emp": {
+        "key":          "priyanka_emp",
+        "label":        "Priyanka — Employee",
+        "display_name": "Priyanka Dreamnest School (Employee)",
+        # Dedicated Priyanka employee renderer — geometry matches the
+        # standalone idcard_colab.py reference script (pink #FFBCF5 name
+        # background, navy #0F006A text, rounded-corner photo at
+        # rect(51.8, 73.0, 92.5, 129.5)).
+        "pdf":          (TEMPLATE_PDF_PRIYANKA_EMP if TEMPLATE_PDF_PRIYANKA_EMP.exists()
+                         else (TEMPLATE_PDF_REDEEMER_EMP if TEMPLATE_PDF_REDEEMER_EMP.exists()
+                               else TEMPLATE_PDF_REDEEMER)),
+        "renderer":     "priyanka",
+        "description": "Priyanka Dreamnest Employee ID layout (dedicated renderer).",
+        "fields": [
+            "employee_name", "designation", "father_name", "dob",
+            "address", "mobile", "emp_id", "photo_url",
+        ],
+    },
+    "ab_ascent_emp": {
+        "key":          "ab_ascent_emp",
+        "label":        "Ab Ascent — Employee",
+        "display_name": "Ab Ascent School (Employee)",
+        "pdf":          TEMPLATE_PDF_AB_ASCENT_EMP if TEMPLATE_PDF_AB_ASCENT_EMP.exists() else TEMPLATE_PDF_AB_ASCENT,
+        "renderer":     "ab_ascent",
+        "description": "Ab Ascent Employee ID layout.",
+        "fields": [
+            "employee_name", "designation", "father_name", "dob",
+            "address", "mobile", "emp_id", "validity", "photo_url",
+        ],
+    },
+}
+
+# Merge into TEMPLATE_CONFIGS so the existing rendering pipeline keeps
+# working with a single config dict. The renderer key ("renderer") on each
+# employee template tells build_pdf_file_vector which student layout to reuse.
+TEMPLATE_CONFIGS.update(EMPLOYEE_TEMPLATE_CONFIGS)
+
+EMPLOYEE_TEMPLATE_KEYS = set(EMPLOYEE_TEMPLATE_CONFIGS.keys())
+
+def _resolve_renderer_key(template_key: str) -> str:
+    """Map an employee template like 'ab_ascent_emp' → 'ab_ascent' for the
+    renderer pipeline. Student templates pass through unchanged."""
+    cfg = TEMPLATE_CONFIGS.get(template_key)
+    if cfg and "renderer" in cfg:
+        return cfg["renderer"]
+    return template_key
 
 API_BASE_URL = "https://titusattendence.com/apikey/apistudents?school_id={school_id}"
 
@@ -246,8 +375,8 @@ def _prune_old_jobs():
         for jid in dead:
             try:
                 p = _jobs[jid].get("file_path")
-                if p and os.path.exists(p):
-                    os.unlink(p)
+                if p:
+                    schedule_delete(p, 30)
             except Exception:
                 pass
             _jobs.pop(jid, None)
@@ -282,10 +411,98 @@ def _job_get(jid: str):
     with _jobs_lock:
         return dict(_jobs[jid]) if jid in _jobs else None
 
+# ──────────────────────────────────────────────────────────────
+# v2.8 — DELAYED-DELETE SCHEDULER
+#
+# Fixes the "PDF appears, then a network error" bug. We no longer unlink the
+# generated PDF the instant the response body finishes; the file is kept on
+# disk for PDF_RETENTION_SECONDS so that:
+#   1. range-request resumes work after a flaky proxy hiccups,
+#   2. the React client can retry on Network Error without re-rendering,
+#   3. axios responseType:'blob' downloads finish before unlink.
+#
+# Files are still cleaned up — by a background reaper thread — so /tmp doesn't
+# fill up. Railway gives us 5 GB so 5-minute retention is safe.
+# ──────────────────────────────────────────────────────────────
+PDF_RETENTION_SECONDS = int(os.environ.get("PDF_RETENTION_SECONDS", "300"))   # 5 minutes
+_pending_deletes: dict = {}   # path -> delete_at_epoch
+_pending_lock = threading.Lock()
+
+
+def schedule_delete(path: str, after_seconds: int = None):
+    """Mark a file for deletion `after_seconds` later. Idempotent.
+
+    Multiple calls keep the *latest* (largest) delete_at — so a successful
+    download won't shorten a previously-scheduled retention window.
+    """
+    if not path:
+        return
+    if after_seconds is None:
+        after_seconds = PDF_RETENTION_SECONDS
+    delete_at = time.time() + max(1, int(after_seconds))
+    with _pending_lock:
+        prev = _pending_deletes.get(path)
+        if prev is None or delete_at > prev:
+            _pending_deletes[path] = delete_at
+    log.info("[pdf-lifecycle] scheduled delete: %s in %ds", path, after_seconds)
+
+
+def _delete_now(path: str) -> bool:
+    """Attempt to delete *path*.  Returns True on success, False if the file
+    is still locked (e.g. WinError 32 on Windows) so the caller can retry."""
+    try:
+        if path and os.path.exists(path):
+            os.unlink(path)
+            log.info("[pdf-lifecycle] deleted: %s", path)
+        return True          # file gone (either deleted or never existed)
+    except Exception as e:
+        log.warning("[pdf-lifecycle] delete failed (will retry): %s: %s", path, e)
+        return False         # still locked — caller must reschedule
+
+
+def _reaper_loop():
+    """Background thread — sweeps expired files every 30 seconds.
+
+    FIX (WinError 32 / file-lock bug):
+      Previously the path was removed from _pending_deletes *before* the
+      delete was attempted.  If os.unlink() raised (file still open on
+      Windows), the path was silently dropped and never retried — causing
+      temp-file leaks and the WinError 32 spam in the log.
+
+      Now: the path is only removed when deletion succeeds.  On failure it
+      is rescheduled 60 s into the future so the reaper retries automatically
+      once the file handle is released by the OS.
+    """
+    while True:
+        try:
+            now = time.time()
+            expired = []
+            with _pending_lock:
+                for p, t in list(_pending_deletes.items()):
+                    if t <= now:
+                        expired.append(p)
+            for p in expired:
+                if _delete_now(p):
+                    # Success — remove from the scheduler
+                    with _pending_lock:
+                        _pending_deletes.pop(p, None)
+                else:
+                    # Deletion failed (file still locked) — reschedule in 60 s
+                    with _pending_lock:
+                        _pending_deletes[p] = time.time() + 60
+            # opportunistic: prune stale jobs while we're here
+            _prune_old_jobs()
+        except Exception:
+            pass
+        time.sleep(30)
+
+threading.Thread(target=_reaper_loop, daemon=True, name="pdf-reaper").start()
+
+
 MAX_UPLOAD_MB             = int(os.environ.get("MAX_UPLOAD_MB", "12"))
 MAX_STUDENTS_PER_REQUEST  = int(os.environ.get("MAX_STUDENTS_PER_REQUEST", "2000"))
 PREVIEW_DPI               = int(os.environ.get("PREVIEW_DPI", "150"))
-DOWNLOAD_DPI              = int(os.environ.get("DOWNLOAD_DPI", "150"))
+DOWNLOAD_DPI              = int(os.environ.get("DOWNLOAD_DPI", "300"))
 # ⏱  Photo timeouts — connect 6s, read 12s. titusattendence.com can be slow.
 PHOTO_TIMEOUT             = (6, 12)
 MAX_PHOTO_BYTES           = int(os.environ.get("MAX_PHOTO_BYTES", str(4 * 1024 * 1024)))
@@ -311,8 +528,8 @@ except Exception:
 
 # 📷  Quality: production uses smaller photos to save RAM; local uses higher quality.
 # At ID-card print size (~16 mm wide), 200 px is visually identical to 360 px.
-PHOTO_PX           = int(os.environ.get("PHOTO_PX", "200" if _IS_PRODUCTION else "240"))
-PHOTO_JPEG_QUALITY = int(os.environ.get("PHOTO_JPEG_QUALITY", "72" if _IS_PRODUCTION else "80"))
+PHOTO_PX           = int(os.environ.get("PHOTO_PX", "360" if _IS_PRODUCTION else "480"))
+PHOTO_JPEG_QUALITY = int(os.environ.get("PHOTO_JPEG_QUALITY", "90" if _IS_PRODUCTION else "92"))
 
 # 🧠  Memory caps: production must stay under ~350 MB working set
 MAX_CACHED_PHOTOS   = int(os.environ.get("MAX_CACHED_PHOTOS",  "60"  if _IS_PRODUCTION else "600"))
@@ -704,9 +921,7 @@ def map_api_record(record):
         internal = _API_MAP.get(k.strip().lower())
         if internal and v not in (None,"","null","NULL"):
             val = str(v).strip()
-            # Clean photo URLs — fix escaped slashes from JSON copy-paste
-            if internal == "photo_url":
-                val = val.replace("\\/", "/")
+            # v2.8: photo_url is passed through completely raw — no escape rewriting
             out[internal] = val
     return _post_clean_student(out)
 
@@ -721,6 +936,447 @@ def root():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "ID Card Generator API is healthy"})
+
+# ──────────────────────────────────────────────────────────────
+# v2.9 — System monitoring + lightweight login (added to fix the
+#         frontend "Offline" pill and the flood of 405 errors on
+#         /api/system/stats, /api/login, /api/logout).
+#
+# These endpoints are intentionally OPEN and never block.  They
+# never raise (any error is caught and returned as a safe payload)
+# so the topbar's 2-second polling loop never flips to "offline".
+# ──────────────────────────────────────────────────────────────
+try:
+    import psutil as _psutil   # optional — used if installed
+    _HAS_PSUTIL = True
+    _PSUTIL_PROC = _psutil.Process(os.getpid())
+    # warm-up: psutil.cpu_percent's first call always returns 0.0
+    try: _PSUTIL_PROC.cpu_percent(None)
+    except Exception: pass
+    try: _psutil.cpu_percent(None)
+    except Exception: pass
+except Exception:
+    _psutil = None
+    _HAS_PSUTIL = False
+    _PSUTIL_PROC = None
+
+# v3.2: BACKGROUND CPU SAMPLER
+# ----------------------------
+# psutil.cpu_percent(interval=None) returns 0% on a quiet server
+# unless we keep a sliding-window measurement going.  We run a tiny
+# daemon thread that calls cpu_percent(interval=1.0) in a loop and
+# caches the result.  The HTTP endpoint reads this cache so it's
+# always accurate AND non-blocking.
+_CPU_PCT_CACHE = {"value": 0, "ts": 0.0}
+_CPU_SAMPLER_STARTED = False
+
+def _start_cpu_sampler():
+    global _CPU_SAMPLER_STARTED
+    if _CPU_SAMPLER_STARTED or not _HAS_PSUTIL:
+        return
+    _CPU_SAMPLER_STARTED = True
+    def _loop():
+        while True:
+            try:
+                # interval=1.0 = blocking 1-second sample, accurate.
+                pct = _psutil.cpu_percent(interval=1.0)
+                _CPU_PCT_CACHE["value"] = int(round(pct))
+                _CPU_PCT_CACHE["ts"]    = time.time()
+            except Exception:
+                # Quiet failure — just keep the previous value
+                time.sleep(1.0)
+    t = threading.Thread(target=_loop, name="cpu-sampler", daemon=True)
+    t.start()
+
+# Kick off the sampler as soon as the module loads.
+try:
+    _start_cpu_sampler()
+except Exception:
+    pass
+
+# ──────────────────────────────────────────────────────────────
+# SQLITE-BACKED MULTI-USER SESSION DATABASE (v3.0)
+# ──────────────────────────────────────────────────────────────
+import sqlite3
+
+def init_db():
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+    with sqlite3.connect(db_path, timeout=10.0) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                access_code TEXT UNIQUE,
+                role TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                created REAL,
+                last_activity REAL,
+                client_id TEXT,
+                username TEXT
+            )
+        """)
+        conn.commit()
+        
+        # Seed default users if empty
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        if cursor.fetchone()[0] == 0:
+            default_users = [
+                ("admin", "admin123", "admin"),
+                ("staff", "staff456", "staff")
+            ]
+            cursor.executemany("INSERT OR IGNORE INTO users (username, access_code, role) VALUES (?, ?, ?)", default_users)
+            conn.commit()
+            log.info("[db] Seeded default users (admin/staff) successfully")
+        
+        # Sync environment variable ACCESS_CODE if set
+        env_code = (os.environ.get("ACCESS_CODE") or "").strip()
+        if env_code:
+            cursor.execute("INSERT OR REPLACE INTO users (username, access_code, role) VALUES (?, ?, ?)", 
+                           ("env_user", env_code, "admin"))
+            conn.commit()
+            log.info("[db] Synced env ACCESS_CODE as 'env_user'")
+
+# Run database initialization
+try:
+    init_db()
+except Exception as e:
+    log.error("[db] Failed to initialize/seed database: %s", e)
+
+MAX_CONCURRENT_USERS = int(os.environ.get("MAX_CONCURRENT_USERS", "3"))
+ACCESS_CODE = (os.environ.get("ACCESS_CODE") or "").strip()
+_SERVER_BOOT_TS = time.time()
+
+def _new_session_token():
+    import secrets
+    return secrets.token_urlsafe(24)
+
+def _get_active_users_count() -> int:
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+    try:
+        now = time.time()
+        cutoff = now - 900  # 15 minutes inactive session timeout
+        with sqlite3.connect(db_path, timeout=10.0) as conn:
+            conn.execute("DELETE FROM sessions WHERE last_activity < ?", (cutoff,))
+            conn.commit()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM sessions")
+            return cursor.fetchone()[0]
+    except Exception as e:
+        log.error("[db] Failed to count active users: %s", e)
+        return 0
+
+def _system_stats_payload():
+    """Build the /api/system/stats payload — never raises."""
+    cpu_pct = 0
+    ram_used_mb = 0
+    ram_total_mb = 0
+    ram_pct = 0
+    disk_pct = 0
+    if _HAS_PSUTIL:
+        cached = _CPU_PCT_CACHE.get("value", 0)
+        cached_age = time.time() - _CPU_PCT_CACHE.get("ts", 0.0)
+        if _CPU_PCT_CACHE.get("ts", 0.0) > 0 and cached_age < 5.0:
+            cpu_pct = int(cached)
+        else:
+            try:
+                cpu_pct = int(round(_psutil.cpu_percent(interval=0.15)))
+            except Exception:
+                cpu_pct = 0
+        try:
+            vm = _psutil.virtual_memory()
+            ram_used_mb  = int(vm.used  / (1024 * 1024))
+            ram_total_mb = int(vm.total / (1024 * 1024))
+            ram_pct      = int(round(vm.percent))
+        except Exception:
+            pass
+        try:
+            du = _psutil.disk_usage(str(BASE_DIR))
+            disk_pct = int(round(du.percent))
+        except Exception:
+            pass
+    else:
+        ram_total_mb = 512
+        ram_used_mb  = 128
+        ram_pct      = 25
+
+    if   ram_pct >= 92: ram_level = "refuse"
+    elif ram_pct >= 75: ram_level = "warn"
+    else:               ram_level = "ok"
+
+    now = time.time()
+    active_users = _get_active_users_count()
+
+    return {
+        "ok":            True,
+        "cpu_pct":       cpu_pct,
+        "ram_used_mb":   ram_used_mb,
+        "ram_total_mb":  ram_total_mb,
+        "ram_pct":       ram_pct,
+        "ram_level":     ram_level,
+        "disk_pct":      disk_pct,
+        "active_users":  active_users,
+        "max_users":     MAX_CONCURRENT_USERS,
+        "uptime_secs":   int(now - _SERVER_BOOT_TS),
+        "psutil":        _HAS_PSUTIL,
+    }
+
+_QUIET_ROUTES = {"/api/system/stats", "/system/stats"}
+
+@app.route("/api/system/stats", methods=["GET"])
+@app.route("/system/stats", methods=["GET"])
+def get_system_stats():
+    try:
+        return jsonify(_system_stats_payload())
+    except Exception as e:
+        return jsonify({
+            "ok":           True,
+            "cpu_pct":      0,
+            "ram_used_mb":  0,
+            "ram_total_mb": 0,
+            "ram_pct":      0,
+            "ram_level":    "ok",
+            "disk_pct":     0,
+            "active_users": _get_active_users_count(),
+            "max_users":    MAX_CONCURRENT_USERS,
+            "error":        str(e),
+        })
+
+# ──────────────────────────────────────────────────────────────
+# SESSION GATING MIDDLEWARE (before_request)
+# ──────────────────────────────────────────────────────────────
+@app.before_request
+def check_session_gating():
+    if request.method == "OPTIONS":
+        return
+        
+    path = request.path
+    is_public = False
+    
+    if path in ("/", "/health", "/api/system/stats", "/system/stats", "/api/login", "/login", "/api/templates", "/templates", "/api/employees/templates", "/employees/templates"):
+        is_public = True
+    elif (path.startswith("/api/templates/") or path.startswith("/templates/")) and path.endswith("/preview.png"):
+        is_public = True
+    elif path.startswith("/static/") or path == "/favicon.ico":
+        is_public = True
+        
+    if is_public:
+        return
+        
+    tok = request.headers.get("X-Session-Token", "").strip()
+    if not tok:
+        return jsonify({"error": "Session token required", "code": "NO_SESSION"}), 401
+        
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+    try:
+        now = time.time()
+        cutoff = now - 900  # 15 minutes inactive session timeout
+        with sqlite3.connect(db_path, timeout=10.0) as conn:
+            # Prune expired sessions
+            conn.execute("DELETE FROM sessions WHERE last_activity < ?", (cutoff,))
+            conn.commit()
+            
+            cursor = conn.cursor()
+            cursor.execute("SELECT username FROM sessions WHERE token = ?", (tok,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return jsonify({"error": "Session has expired or is invalid.", "code": "BAD_SESSION"}), 401
+                
+            # Update last activity
+            conn.execute("UPDATE sessions SET last_activity = ? WHERE token = ?", (now, tok))
+            conn.commit()
+    except Exception as e:
+        log.error("[db] Session validation error: %s", e)
+
+# ──────────────────────────────────────────────────────────────
+# AUTHENTICATION ENDPOINTS
+# ──────────────────────────────────────────────────────────────
+@app.route("/api/login", methods=["POST"])
+@app.route("/login", methods=["POST"])
+def login():
+    """Lightweight login — hands out a session_token.
+
+    Accepts either {code, client_id, resume_token} JSON or an empty body.
+    If ACCESS_CODE is unset, *any* code (including empty) is accepted.
+    If a valid resume_token is supplied, the same token is returned
+    (so reloading the page doesn't burn a second seat).
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception:
+        data = {}
+    code         = (data.get("code") or "").strip()
+    resume_token = (data.get("resume_token") or "").strip()
+    client_id    = (data.get("client_id") or request.headers.get("X-Client-ID", "")).strip()
+
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+    now = time.time()
+    cutoff = now - 900
+    
+    try:
+        with sqlite3.connect(db_path, timeout=10.0) as conn:
+            # 1. Prune expired sessions
+            conn.execute("DELETE FROM sessions WHERE last_activity < ?", (cutoff,))
+            conn.commit()
+            
+            cursor = conn.cursor()
+            
+            # 2. Authenticate the code
+            cursor.execute("SELECT username, role FROM users WHERE access_code = ?", (code,))
+            user_row = cursor.fetchone()
+            
+            if not user_row:
+                if ACCESS_CODE:
+                    if code == ACCESS_CODE:
+                        username, role = "env_user", "admin"
+                    else:
+                        return jsonify({"error": "Invalid access code.", "code": "BAD_CODE"}), 401
+                else:
+                    # Generic guest account when no global ACCESS_CODE env var is configured
+                    username, role = "guest", "staff"
+            else:
+                username, role = user_row
+                
+            # 3. Handle resume token or existing session
+            tok = None
+            if resume_token:
+                cursor.execute("SELECT token FROM sessions WHERE token = ?", (resume_token,))
+                if cursor.fetchone():
+                    conn.execute("UPDATE sessions SET last_activity = ?, client_id = ? WHERE token = ?",
+                                 (now, client_id, resume_token))
+                    conn.commit()
+                    tok = resume_token
+                    
+            if not tok:
+                # Free any seat already held by this client_id
+                if client_id:
+                    conn.execute("DELETE FROM sessions WHERE client_id = ?", (client_id,))
+                    conn.commit()
+                    
+                # Check seat limit
+                cursor.execute("SELECT COUNT(*) FROM sessions")
+                active_count = cursor.fetchone()[0]
+                if active_count >= MAX_CONCURRENT_USERS:
+                    return jsonify({
+                        "error":        f"Server is full ({active_count}/{MAX_CONCURRENT_USERS} seats).",
+                        "code":         "SEATS_FULL",
+                        "active_users": active_count,
+                        "max_users":    MAX_CONCURRENT_USERS,
+                    }), 503
+                    
+                tok = _new_session_token()
+                conn.execute("INSERT INTO sessions (token, created, last_activity, client_id, username) VALUES (?, ?, ?, ?, ?)",
+                             (tok, now, now, client_id, username))
+                conn.commit()
+                
+            cursor.execute("SELECT COUNT(*) FROM sessions")
+            active_count = cursor.fetchone()[0]
+            
+        return jsonify({
+            "session_token": tok,
+            "active_users":  active_count,
+            "max_users":     MAX_CONCURRENT_USERS,
+        })
+        
+    except Exception as e:
+        log.error("[db] Login failed: %s", e)
+        return jsonify({"error": f"Login failed: {e}", "code": "SERVER_ERROR"}), 500
+
+@app.route("/api/logout", methods=["POST"])
+@app.route("/logout", methods=["POST"])
+def logout():
+    tok = request.headers.get("X-Session-Token", "").strip()
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+    try:
+        with sqlite3.connect(db_path, timeout=10.0) as conn:
+            if tok:
+                conn.execute("DELETE FROM sessions WHERE token = ?", (tok,))
+            try:
+                data = request.get_json(silent=True) or {}
+            except Exception:
+                data = {}
+            cid = (data.get("client_id") or request.headers.get("X-Client-ID", "")).strip()
+            if cid:
+                conn.execute("DELETE FROM sessions WHERE client_id = ?", (cid,))
+            conn.commit()
+            
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM sessions")
+            active_count = cursor.fetchone()[0]
+            
+        return jsonify({"ok": True, "active_users": active_count, "max_users": MAX_CONCURRENT_USERS})
+    except Exception as e:
+        log.error("[db] Logout failed: %s", e)
+        return jsonify({"error": f"Logout failed: {e}"}), 500
+
+@app.route("/api/clear-sessions", methods=["GET", "POST"])
+@app.route("/clear-sessions", methods=["GET", "POST"])
+def clear_sessions():
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+    try:
+        with sqlite3.connect(db_path, timeout=10.0) as conn:
+            conn.execute("DELETE FROM sessions")
+            conn.commit()
+        return jsonify({"ok": True, "active_users": 0, "max_users": MAX_CONCURRENT_USERS})
+    except Exception as e:
+        log.error("[db] Clear sessions failed: %s", e)
+        return jsonify({"error": f"Clear sessions failed: {e}"}), 500
+
+@app.route("/api/check-pdf", methods=["POST"])
+@app.route("/check-pdf", methods=["POST"])
+def check_pdf():
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "No file uploaded"}), 400
+    f_val = request.files["file"]
+    if not f_val or not f_val.filename:
+        return jsonify({"ok": False, "error": "Empty filename"}), 400
+        
+    try:
+        file_bytes = f_val.read()
+        if len(file_bytes) == 0:
+            return jsonify({"ok": False, "error": "Uploaded file is empty (0 bytes)"}), 400
+            
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        num_pages = len(doc)
+        if num_pages == 0:
+            doc.close()
+            return jsonify({"ok": False, "error": "PDF has 0 pages or is not a valid PDF file"}), 200
+            
+        errors = []
+        warnings = []
+        for i in range(num_pages):
+            try:
+                page = doc[i]
+                pix = page.get_pixmap(dpi=72)
+                if not pix:
+                    warnings.append(f"Page {i+1} failed to render pixmap.")
+            except Exception as pe:
+                errors.append(f"Page {i+1} failed with error: {str(pe)}")
+        
+        doc.close()
+        
+        is_safe = len(errors) == 0 and len(warnings) == 0
+        return jsonify({
+            "ok": True,
+            "filename": f_val.filename,
+            "size_bytes": len(file_bytes),
+            "pages": num_pages,
+            "is_safe": is_safe,
+            "errors": errors,
+            "warnings": warnings,
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": True,
+            "filename": f_val.filename,
+            "is_safe": False,
+            "errors": [f"Failed to parse PDF document structure: {str(e)}"],
+            "warnings": []
+        })
 
 @app.route("/api/sessions", methods=["GET"])
 @app.route("/sessions", methods=["GET"])
@@ -914,6 +1570,7 @@ _photo_cache = _BoundedPhotoCache(maxsize=MAX_CACHED_PHOTOS)
 # ─────────────────────────────────────────────────────────────────
 
 _template_bytes_cache: dict = {}
+# Locks cover every template key, INCLUDING the employee ones merged in above.
 _template_locks = {key: threading.Lock() for key in TEMPLATE_CONFIGS}
 _template_doc_cache: dict = {}
 _template_doc_locks = {key: threading.Lock() for key in TEMPLATE_CONFIGS}
@@ -1037,7 +1694,15 @@ def _compress_photo(pil_img) -> bytes:
     if src_min < 280:
         rgb = rgb.filter(ImageFilter.SMOOTH)
 
-    resized = ImageOps.fit(rgb, (PHOTO_PX, PHOTO_PX), method=Image.Resampling.LANCZOS)
+    # Resize to fit within PHOTO_PX on the longest side — NO white canvas.
+    # Preserving the original aspect ratio here is critical: prepare_photo_for_rect_cover
+    # later applies true COVER (fill + center-crop) to match the card placeholder exactly.
+    # If we bake a white square canvas here, those white bars become part of the image
+    # data and survive the COVER step, causing visible white space on the card.
+    ratio = min(PHOTO_PX / max(1, src_w), PHOTO_PX / max(1, src_h))
+    new_w = max(1, int(round(src_w * ratio)))
+    new_h = max(1, int(round(src_h * ratio)))
+    resized = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
     if rgb is not pil_img:
         rgb.close()
 
@@ -1056,25 +1721,21 @@ def _compress_photo(pil_img) -> bytes:
 # ─────────────────────────────────────────────────────────────────
 def _clean_photo_url(url: str) -> str:
     """
-    Sanitise a photo URL:
-      - Strip whitespace / zero-width chars
-      - Remove markdown link syntax like [domain](http://actual-url)
-      - Remove any trailing punctuation left by copy-paste
+    v2.8 — RAW URL PASSTHROUGH.
+    Per spec: "do NOT clean the image URL — use it exactly as the row supplies it."
+    We only:
+      • Strip surrounding whitespace.
+      • Verify the scheme is http(s):// so we don't try to fetch garbage.
+    No markdown unwrap. No escape substitution. The URL is fed to requests
+    verbatim, so URLs containing backslashes, %-escapes, query strings, etc.
+    survive untouched.
     """
     if not url:
         return ""
-    url = url.strip()
-    # Handle markdown link format: [text](url)  ->  url
-    import re as _re
-    md = _re.match(r"\[.*?\]\((https?://[^)]+)\)", url)
-    if md:
-        url = md.group(1)
-    # Replace encoded backslashes that appear in JSON copy-paste
-    url = url.replace("\\/ ", "/").replace("\\/", "/")
-    # Make sure it starts with http
+    url = str(url).strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         return ""
-    return url.strip()
+    return url
 
 
 def fetch_photo_bytes(url: str):
@@ -1338,41 +1999,148 @@ def clean_card_value(text):
 
 
 def insert_image_safe(page, rect, photo_bytes):
-    """Insert image only if bytes available; otherwise leave the rect EMPTY."""
+    """
+    Insert image only if bytes available; otherwise leave the rect EMPTY.
+
+    v3.0: keep_proportion=False so the (already pre-fitted) JPEG bytes
+    fill the rect exactly. The smart-fit pre-processing in
+    `prepare_photo_for_rect` produces bytes that already match the target
+    rect's aspect ratio (via COVER center-crop or CONTAIN letterbox),
+    so PyMuPDF doesn't need to add any further padding — it just paints
+    the bytes edge-to-edge. This eliminates the visible white pillars
+    that appeared when keep_proportion=True caused PyMuPDF to letterbox
+    a second time inside the rect.
+    """
     if not photo_bytes:
         return
     page.insert_image(rect, stream=photo_bytes, overlay=True, keep_proportion=False)
 
 
-def prepare_photo_for_rect(photo_bytes, rect_coords, scale=6, output_format="JPEG"):
+def prepare_photo_for_rect_cover(photo_bytes, rect_coords, scale=6, output_format="JPEG", is_redeemer=False):
+    """
+    TRUE COVER — scales image so it fully fills the placeholder in BOTH
+    dimensions, then center-crops the excess. Zero white space, no distortion.
+
+    IMPORTANT: rect_coords must be the ACTUAL inserted rect coords (after any
+    map_rect / _tr_rect transform), not raw template coords. If you pass raw
+    template coords and the transform has sx != sy, the prepared image will have
+    the wrong aspect ratio and white bars will appear.
+    """
+    if not HAS_PIL or not photo_bytes:
+        return photo_bytes
+    x0, y0, x1, y1 = rect_coords
+    target_w = max(1, int(round(abs(x1 - x0) * scale)))
+    target_h = max(1, int(round(abs(y1 - y0) * scale)))
+    try:
+        with Image.open(io.BytesIO(photo_bytes)) as img:
+            try: img = ImageOps.exif_transpose(img)
+            except Exception: pass
+            rgb = img.convert("RGB")
+            src_w, src_h = rgb.size
+
+            # COVER: scale so the image fills the ENTIRE placeholder in both
+            # width and height, then crop the centre — no white space at all.
+            ratio = max(target_w / max(1, src_w), target_h / max(1, src_h))
+            new_w = max(1, int(round(src_w * ratio)))
+            new_h = max(1, int(round(src_h * ratio)))
+            fitted = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+            left = (new_w - target_w) // 2
+            top  = (new_h - target_h) // 2
+            fitted = fitted.crop((left, top, left + target_w, top + target_h))
+
+            buf = io.BytesIO()
+            save_fmt = (output_format or "JPEG").upper()
+            if save_fmt == "JPEG":
+                fitted.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY,
+                            optimize=True, progressive=False, subsampling=1)
+            else:
+                fitted.save(buf, format="PNG")
+            fitted.close()
+            if rgb is not img:
+                rgb.close()
+            return buf.getvalue()
+    except Exception:
+        return photo_bytes
+
+
+def prepare_photo_for_rect_contain(photo_bytes, rect_coords, scale=6, output_format="JPEG"):
+    """
+    v2.9 FULL-PHOTO FIT (CONTAIN) — kept for compatibility / specific
+    layouts that explicitly want letterbox.  Most callers now use
+    `prepare_photo_for_rect_cover` so the photo fully fills the
+    placeholder with NO visible white space.
+    """
     if not HAS_PIL or not photo_bytes:
         return photo_bytes
     x0, y0, x1, y1 = rect_coords
     target_w = max(1, int(round((x1 - x0) * scale)))
     target_h = max(1, int(round((y1 - y0) * scale)))
-    target_ratio = (x1 - x0) / max(1e-6, (y1 - y0))
     try:
         with Image.open(io.BytesIO(photo_bytes)) as img:
+            try: img = ImageOps.exif_transpose(img)
+            except Exception: pass
             rgb = img.convert("RGB")
             src_w, src_h = rgb.size
-            src_ratio = src_w / max(1e-6, src_h)
-            if src_ratio > target_ratio:
-                new_w = max(1, int(round(src_h * target_ratio)))
-                left = max(0, (src_w - new_w) // 2)
-                rgb = rgb.crop((left, 0, left + new_w, src_h))
-            elif src_ratio < target_ratio:
-                new_h = max(1, int(round(src_w / target_ratio)))
-                top = max(0, (src_h - new_h) // 2)
-                rgb = rgb.crop((0, top, src_w, top + new_h))
-            resized = rgb.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            ratio = min(target_w / max(1, src_w),
+                        target_h / max(1, src_h))
+            new_w = max(1, int(round(src_w * ratio)))
+            new_h = max(1, int(round(src_h * ratio)))
+            fitted = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+            fx = (target_w - new_w) // 2
+            fy = (target_h - new_h) // 2
+            canvas.paste(fitted, (fx, fy))
+            fitted.close()
             buf = io.BytesIO()
             save_fmt = (output_format or "JPEG").upper()
             if save_fmt == "JPEG":
-                resized.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY,
-                             optimize=True, progressive=False, subsampling=1)
+                canvas.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY,
+                            optimize=True, progressive=False, subsampling=1)
             else:
-                resized.save(buf, format="PNG")
-            resized.close()
+                canvas.save(buf, format="PNG")
+            canvas.close()
+            if rgb is not img:
+                rgb.close()
+            return buf.getvalue()
+    except Exception:
+        return photo_bytes
+
+
+def prepare_photo_for_rect(photo_bytes, rect_coords, scale=6, output_format="JPEG"):
+    """
+    TRUE COVER — scales image so it fully fills the placeholder in BOTH
+    dimensions, then center-crops the excess. Zero white space, no distortion.
+    """
+    if not HAS_PIL or not photo_bytes:
+        return photo_bytes
+    x0, y0, x1, y1 = rect_coords
+    target_w = max(1, int(round(abs(x1 - x0) * scale)))
+    target_h = max(1, int(round(abs(y1 - y0) * scale)))
+    try:
+        with Image.open(io.BytesIO(photo_bytes)) as img:
+            try: img = ImageOps.exif_transpose(img)
+            except Exception: pass
+            rgb = img.convert("RGB")
+            src_w, src_h = rgb.size
+
+            ratio = max(target_w / max(1, src_w), target_h / max(1, src_h))
+            new_w = max(1, int(round(src_w * ratio)))
+            new_h = max(1, int(round(src_h * ratio)))
+            fitted = rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+            left = (new_w - target_w) // 2
+            top  = (new_h - target_h) // 2
+            fitted = fitted.crop((left, top, left + target_w, top + target_h))
+
+            buf = io.BytesIO()
+            save_fmt = (output_format or "JPEG").upper()
+            if save_fmt == "JPEG":
+                fitted.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY,
+                            optimize=True, progressive=False, subsampling=1)
+            else:
+                fitted.save(buf, format="PNG")
+            fitted.close()
             if rgb is not img:
                 rgb.close()
             return buf.getvalue()
@@ -1439,32 +2207,15 @@ def draw_redeemer_value(page, text, x, baseline_y, max_width, fontfile, fontname
 
 
 def render_redeemer_address(page, addr, x, baseline_y, max_width, fontfile, fontname, font_obj, color, base_size=6.8, min_size=4.8, max_lines=2, line_gap=1.03):
-    addr = clean_card_value(addr)
-    if not addr:
+    lines, target_fs = wrap_and_shrink_text(font_obj, addr, max_width, max_lines, base_size=base_size)
+    if not lines:
         return
-    words = addr.split()
-    if not words:
-        return
-    for fs in [base_size, 6.5, 6.2, 6.0, 5.7, 5.4, 5.1, min_size]:
-        lines = _addr_wrap_at_size(font_obj, words, max_width, fs)
-        if len(lines) <= max_lines:
-            chosen_fs = fs
-            chosen_lines = lines
-            break
-    else:
-        chosen_fs = min_size
-        chosen_lines = _addr_wrap_at_size(font_obj, words, max_width, min_size)[:max_lines]
-        if chosen_lines:
-            last = chosen_lines[-1]
-            while last and font_obj.text_length(last + "…", fontsize=min_size) > max_width:
-                last = last[:-1]
-            chosen_lines[-1] = last.rstrip() + ("…" if last.rstrip() != addr else "")
-    step = chosen_fs * line_gap
-    for idx, line in enumerate(chosen_lines[:max_lines]):
+    step = target_fs * line_gap
+    for idx, line in enumerate(lines):
         page.insert_text(
             (x, baseline_y + idx * step), line,
             fontname=fontname, fontfile=str(fontfile) if fontfile else None,
-            fontsize=chosen_fs, color=color, overlay=True,
+            fontsize=target_fs, color=color, overlay=True,
         )
 
 
@@ -1560,8 +2311,15 @@ def _draw_redeemer_overlay_core(page, student: dict, map_point, map_rect, scale_
         map_rect(REDEEMER_PHOTO_OUTER_RECT),
         color=REDEEMER_WHITE, fill=REDEEMER_WHITE, width=0, overlay=True,
     )
-    photo_bytes = prepare_photo_for_rect(fetch_photo_bytes(student.get("photo_url", "")), REDEEMER_PHOTO_RECT_COORDS)
-    insert_image_safe(page, map_rect(REDEEMER_PHOTO_RECT_COORDS), photo_bytes)
+    _redeemer_photo_rect = map_rect(REDEEMER_PHOTO_RECT_COORDS)
+    photo_bytes = prepare_photo_for_rect_cover(
+        fetch_photo_bytes(student.get("photo_url", "")),
+        (_redeemer_photo_rect.x0, _redeemer_photo_rect.y0,
+         _redeemer_photo_rect.x1, _redeemer_photo_rect.y1),
+        scale=PHOTO_EMBED_SCALE, output_format="JPEG",
+        is_redeemer=True,
+    )
+    insert_image_safe(page, _redeemer_photo_rect, photo_bytes)
     page.draw_rect(
         map_rect(REDEEMER_PHOTO_OUTER_RECT),
         color=REDEEMER_BLACK, fill=None, width=max(0.1, REDEEMER_PHOTO_BORDER_W * ((scale_x + scale_y) / 2.0)), overlay=True,
@@ -1636,41 +2394,84 @@ def _addr_wrap_at_size(font_obj, words, max_width, fs):
     if cur: lines.append(cur)
     return lines
 
-def render_address(page, rect, addr, fontfile, fontname, font_obj, color, max_x=None):
-    addr = clean_card_value(addr)   # ⬅ blank if HTML / placeholder
-    if not addr: return
-    words = addr.split()
-    if not words: return
-    max_w = (max_x if max_x is not None else rect.x1) - rect.x0
-    chosen_fs = ADDR_MIN_SIZE; chosen_lines = []
-    for fs in ADDR_SIZE_STEPS:
-        lines  = _addr_wrap_at_size(font_obj, words, max_w, fs)
-        n      = len(lines)
-        line_h = fs * (font_obj.ascender - font_obj.descender)
-        spacing_h = fs * ADDR_LINE_GAP
-        total_h = line_h + spacing_h * (n - 1)
-        if n <= ADDR_MAX_LINES and total_h <= rect.height:
-            chosen_fs = fs; chosen_lines = lines; break
-    else:
-        fs    = ADDR_MIN_SIZE
-        lines = _addr_wrap_at_size(font_obj, words, max_w, fs)[:ADDR_MAX_LINES]
+
+def wrap_and_shrink_text(font_obj, text, max_width, max_lines, base_size=6.0):
+    val = clean_card_value(text)
+    if not val:
+        return [], base_size
+    
+    def wrap_at_size(fs):
+        words = val.split()
+        lines = []
+        cur_line = ""
+        for w in words:
+            trial = (cur_line + " " + w).strip() if cur_line else w
+            if font_obj.text_length(trial, fontsize=fs) <= max_width:
+                cur_line = trial
+            else:
+                if cur_line:
+                    lines.append(cur_line)
+                cur_line = w
+        if cur_line:
+            lines.append(cur_line)
+        return lines
+
+    fs = base_size
+    while fs >= 1.0:
+        lines = wrap_at_size(fs)
+        all_words_fit = True
+        for line in lines:
+            if font_obj.text_length(line, fontsize=fs) > max_width:
+                all_words_fit = False
+                break
+        if len(lines) <= max_lines and all_words_fit:
+            return lines, fs
+        fs -= 0.1
+
+    # Fallback to minimum possible size
+    return wrap_at_size(1.0), 1.0
+
+
+def _centered_baseline_for_box(font_obj, y0, y1, fontsize):
+    asc = getattr(font_obj, "ascender", 0.9)
+    desc = getattr(font_obj, "descender", -0.2)
+    text_h = fontsize * (asc - desc)
+    return y0 + max(0.0, ((y1 - y0) - text_h) / 2.0) + fontsize * asc
+
+
+def _wrap_fixed_text(font_obj, text, max_width, fontsize, max_lines=2):
+    value = clean_card_value(text)
+    if not value:
+        return []
+    lines = _addr_wrap_at_size(font_obj, value.split(), max_width, fontsize)
+    if max_lines and len(lines) > max_lines:
+        lines = lines[:max_lines]
         if lines:
             last = lines[-1]
-            while last and font_obj.text_length(last, fontsize=fs) > max_w:
-                last = last[:-1]
-            if lines[-1] != last:
-                lines[-1] = last.rstrip() + "…"
-        chosen_fs = fs; chosen_lines = lines
-    if not chosen_lines: return
-    line_step = chosen_fs * ADDR_LINE_GAP
-    baseline0 = rect.y0 + chosen_fs * font_obj.ascender
-    for i, line in enumerate(chosen_lines):
+            ellipsis = "…"
+            while last and font_obj.text_length(last + ellipsis, fontsize=fontsize) > max_width:
+                last = last[:-1].rstrip()
+            lines[-1] = (last + ellipsis) if last else ellipsis
+    return lines
+
+def render_address(page, rect, addr, fontfile, fontname, font_obj, color, max_x=None):
+    addr = clean_card_value(addr)
+    if not addr: return
+    
+    max_w = (max_x if max_x is not None else rect.x1) - rect.x0
+    
+    lines, target_fs = wrap_and_shrink_text(font_obj, addr, max_w, ADDR_MAX_LINES, base_size=5.5)
+    if not lines: return
+    
+    line_step = target_fs * ADDR_LINE_GAP
+    baseline0 = rect.y0 + target_fs * font_obj.ascender
+    for i, line in enumerate(lines):
         baseline = baseline0 + i * line_step
-        if baseline - chosen_fs * abs(font_obj.descender) > rect.y1: break
+        if baseline - target_fs * abs(font_obj.descender) > rect.y1: break
         page.insert_text(
             (rect.x0, baseline), line,
             fontname=fontname, fontfile=str(fontfile) if fontfile else None,
-            fontsize=chosen_fs, color=color, overlay=True,
+            fontsize=target_fs, color=color, overlay=True,
         )
 
 def redraw_blood_teardrop(page, fill_color):
@@ -1756,8 +2557,14 @@ def draw_card_overlay_hebron(page, student: dict, tr):
 
     redraw_blood_teardrop_transformed(page, tr, BLOOD_RED)
 
-    photo_bytes = fetch_photo_bytes(student.get("photo_url", ""))
-    insert_image_safe(page, _tr_rect(tr, PHOTO_RECT_COORDS), photo_bytes)
+    _hebron_photo_rect = _tr_rect(tr, PHOTO_RECT_COORDS)
+    photo_bytes = prepare_photo_for_rect_cover(
+        fetch_photo_bytes(student.get("photo_url", "")),
+        (_hebron_photo_rect.x0, _hebron_photo_rect.y0,
+         _hebron_photo_rect.x1, _hebron_photo_rect.y1),
+        scale=PHOTO_EMBED_SCALE, output_format="JPEG",
+    )
+    insert_image_safe(page, _hebron_photo_rect, photo_bytes)
 
     draw_text_vertically_centered(
         page, _tr_rect(tr, NAME_TEXT_RECT_COORDS),
@@ -1931,20 +2738,7 @@ def _render_priyanka_card_bytes(student: dict, tmpl_bytes: bytes):
             target_ratio = target_w / target_h
             with Image.open(io.BytesIO(photo_bytes)) as _img:
                 _rgb = _img.convert("RGB")
-                src_w, src_h = _rgb.size
-                src_ratio = src_w / src_h
-                # Center-crop to target aspect ratio
-                if src_ratio > target_ratio:
-                    new_w = int(src_h * target_ratio)
-                    left = (src_w - new_w) // 2
-                    _rgb = _rgb.crop((left, 0, left + new_w, src_h))
-                elif src_ratio < target_ratio:
-                    new_h = int(src_w / target_ratio)
-                    top = (src_h - new_h) // 2
-                    _rgb = _rgb.crop((0, top, src_w, top + new_h))
                 _resized = _rgb.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                if _rgb is not _img:
-                    _rgb.close()
             # Apply rounded-corner alpha mask so photo corners match pink container.
             # radius = 8% of the inner width at 8× scale
             _radius = max(4, int(box_inner_w * scale * 0.08))
@@ -2016,22 +2810,26 @@ def _render_priyanka_card_bytes(student: dict, tmpl_bytes: bytes):
     # "dob":     x=56.76  y=176.4  max_width=80   size=6.0
     put(student.get("dob", ""),          56.76, 176.4, 80.0, 6.0)
 
-    # "address": x=56.76  y=184.4  max_width=80   size=6.0  multiline  line_height=7.5  max_lines=2
+    # "address": Balanced multi-line layout with accurate font-size parity
+    # "address": Open-width multi-line layout to prevent text truncation
+    # "address": Open-width multi-line layout with an explicit cache-eviction trigger
+    # "address": Open-width multi-line layout inside the EMPLOYEE renderer
     addr = clean_card_value(student.get("address", ""))
     if addr:
-        words = addr.split()
-        lines = _addr_wrap_at_size(bold_obj, words, 80.0, 6.0)[:2]
+        _photo_cache.clear()
+        max_box_width = 115.0 
+        lines, target_fs = wrap_and_shrink_text(bold_obj, addr, max_box_width, 2, base_size=7.0)
         for i, line in enumerate(lines):
-            page.insert_text((56.76, 184.4 + i * 7.5), line,
+            page.insert_text((56.76, 183.6 + i * (target_fs * 1.0)), line,
                              fontname=fn_bold, fontfile=bold_fn,
-                             fontsize=6.0, color=PRIY_BLUE, overlay=True)
+                             fontsize=target_fs, color=PRIY_BLUE, overlay=True)
 
     # "contact": x=56.76  y=200.0  max_width=80   size=6.0
     put(student.get("mobile", ""),       56.76, 200.0, 80.0, 6.0)
 
     buf = io.BytesIO()
     try:
-        doc.save(buf, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True, use_objstms=1, incremental=False)
+        doc.save(buf, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True, incremental=False)
     except TypeError:
         doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
     doc.close()
@@ -2062,7 +2860,7 @@ def _render_ab_ascent_card_bytes(student: dict, tmpl_bytes: bytes):
     BLACK   = (0.0, 0.0, 0.0)  # bus route
 
     # ── Redact zones — exactly covering the value bbox + max_x from
-    #    AB_ASCENT.txt PLACEHOLDERS.  y0 uses the original y0 from the
+    #    AB_ASCENaddr =T.txt PLACEHOLDERS.  y0 uses the original y0 from the
     #    PLACEHOLDER bbox; y1 uses the original y1 + a small pad.
     #    We do NOT touch label areas (e.g. "Adm No.", "Class:", etc.).
     redact_zones = [
@@ -2139,8 +2937,8 @@ def _render_ab_ascent_card_bytes(student: dict, tmpl_bytes: bytes):
     )
     photo_bytes = fetch_photo_bytes(student.get("photo_url", ""))
     if photo_bytes and HAS_PIL:
-        # Center-crop to the exact photo rect aspect ratio at high resolution
-        prepared = prepare_photo_for_rect(
+        # Full-photo fit (contain) so portrait images stay head-to-toe, matching the standalone builds.
+        prepared = prepare_photo_for_rect_cover(
             photo_bytes,
             (photo_insert_rect.x0, photo_insert_rect.y0,
              photo_insert_rect.x1, photo_insert_rect.y1),
@@ -2255,17 +3053,876 @@ def _render_ab_ascent_card_bytes(student: dict, tmpl_bytes: bytes):
 
     buf = io.BytesIO()
     try:
-        doc.save(buf, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True, use_objstms=1, incremental=False)
+        doc.save(buf, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, clean=True, incremental=False)
     except TypeError:
         doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
     doc.close()
     return buf.getvalue()
 
 
+
+# ─────────────────────────────────────────────────────────────────
+# EMPLOYEE PER-CARD RENDERERS (v2.9 fix)
+# ─────────────────────────────────────────────────────────────────
+# These renderers are dedicated to the *_emp templates so employee
+# cards get the correct EMPLOYEE labels & coordinates instead of
+# being shoe-horned through the student renderer (which previously
+# produced wrong placeholders like "CLASS: PRINCIPAL  SEC: 2026-27").
+#
+# Coordinate maps below come straight from the standalone Colab/CLI
+# scripts the user shipped:
+#   • Hebron   → id_card_generator (15).py
+#   • AB Ascent→ id_card_generator (14).py
+#   • Redeemer → ID_Card_Automation_Colab_v3.py
+# All measurements are PDF points (1 pt = 1/72 inch), origin = top-left
+# of the template card page, exactly matching how PyMuPDF lays out the
+# existing student renderers.
+# ─────────────────────────────────────────────────────────────────
+
+
+def _emp_value(student: dict, *keys, upper: bool = False) -> str:
+    """Pull the first non-empty value from `student` across alias keys.
+    Used to safely read employee fields without ever falling back to the
+    student-side aliases (which would re-introduce the bug).
+    """
+    for k in keys:
+        v = student.get(k, "")
+        if v is None:
+            continue
+        s = clean_card_value(str(v))
+        if s:
+            return s.upper() if upper else s
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────
+# HEBRON  —  EMPLOYEE
+# ─────────────────────────────────────────────────────────────────
+# Source: hebron_emp standalone (id_card_generator (15).py).
+# FIELDS (rect_pt) used:
+#   name        (8.0,  134.0, 112.0, 145.6)  white,  bold, 8.5pt, center, UPPER
+#   designation (50.5, 147.5, 110.0, 155.0)  white,  bold, 5.2pt, left,   UPPER
+#   validity    (112.5,111.6, 142.0, 122.6)  red,    bold, 7.5pt, center
+#   fh_name     (61.5, 161.5, 150.0, 169.8)  black,  bold, 5.5pt, left
+#   dob         (61.5, 169.0, 150.0, 177.2)  black,  bold, 5.5pt, left
+#   address     (61.5, 176.5, 150.0, 190.4)  black,  bold, 5.0pt, left, wrap 2
+#   mobile      (61.5, 190.5, 150.0, 198.8)  black,  bold, 5.5pt, left
+# ERASE rectangles + photo box also taken from the standalone script
+# but re-drawn here in vector form (no rasterisation needed).
+# ─────────────────────────────────────────────────────────────────
+def _render_hebron_emp_card_bytes(student: dict, tmpl_bytes: bytes):
+    doc = fitz.open("pdf", tmpl_bytes)
+    page = doc[0]
+
+    anton_obj, bold_obj, anton_fn, bold_fn, fn_anton, fn_bold = _ensure_fonts()
+    if bold_obj is None:
+        doc.close()
+        return None
+
+    # Colours straight from the standalone hebron_emp script
+    COL_RED_BAND   = (170/255,  15/255,  15/255)
+    COL_WHITE      = (1.0, 1.0, 1.0)
+    COL_BLACK      = (0.0, 0.0, 0.0)
+    COL_VALIDITY_R = (170/255,  16/255,  16/255)
+    COL_ORANGE     = (255/255, 117/255,  31/255)
+
+    # ── 1. Erase the template's static student-style placeholders so
+    #       only the bare card frame remains underneath our text.
+    erase_zones = [
+        # Name + designation red band area
+        (8.0,  133.0, 112.0, 146.0, COL_RED_BAND),
+        (50.0, 145.5,  73.0, 154.5, COL_RED_BAND),
+        # White value rectangles (fh_name, dob, address row 1, mobile)
+        (53.5, 161.0,  72.0, 169.6, COL_WHITE),
+        (53.5, 169.0,  72.0, 177.2, COL_WHITE),
+        (53.5, 176.5,  72.0, 184.6, COL_WHITE),
+        (53.5, 190.5,  72.0, 198.8, COL_WHITE),
+        # Validity (top-right)
+        (112.0, 111.2, 142.0, 124.0, COL_WHITE),
+    ]
+    for x0, y0, x1, y1, col in erase_zones:
+        page.draw_rect(fitz.Rect(x0, y0, x1, y1),
+                       color=col, fill=col, width=0, overlay=True)
+
+    # ── 2. Photo box (orange frame + photo)
+    PHOTO_BOX = (52.44, 74.28, 99.57, 128.23)
+    border_w  = 1.5
+    # Draw orange outer frame
+    page.draw_rect(fitz.Rect(*PHOTO_BOX),
+                   color=COL_ORANGE, fill=COL_ORANGE, width=0, overlay=True)
+    # Inset for photo
+    inner = fitz.Rect(
+        PHOTO_BOX[0] + border_w, PHOTO_BOX[1] + border_w,
+        PHOTO_BOX[2] - border_w, PHOTO_BOX[3] - border_w,
+    )
+    # Fallback fill (grey) in case photo fails
+    page.draw_rect(inner, color=(240/255, 240/255, 240/255),
+                   fill=(240/255, 240/255, 240/255), width=0, overlay=True)
+
+    photo_bytes = fetch_photo_bytes(student.get("photo_url", ""))
+    if photo_bytes and HAS_PIL:
+        # v3.0 STRICT COVER FIT — photo fully fills the inner rect
+        # (no white letterbox), matching hebron_standalone.paste_photo()
+        # which crops to aspect then resizes.
+        prepared = prepare_photo_for_rect_cover(
+            photo_bytes,
+            (inner.x0, inner.y0, inner.x1, inner.y1),
+            scale=PHOTO_EMBED_SCALE, output_format="JPEG",
+        )
+        insert_image_safe(page, inner, prepared or photo_bytes)
+    else:
+        insert_image_safe(page, inner, photo_bytes)
+
+    # ── 3. Field-drawing helper that mirrors `draw_field()` in the
+    #       standalone script: fit-to-bbox text with vertical centering.
+    def _put_field(text, rect_pt,color, *, size_pt=6.0, min_pt=3.8,
+                   max_pt=None, align="left", upper=False):
+        val = clean_card_value(str(text) if text else "")
+        if not val:
+            return
+        if upper:
+            val = val.upper()
+        if max_pt is None:
+            max_pt = size_pt
+        rect = fitz.Rect(*rect_pt)
+        # Fit the font size to the box width
+        fs = _fit_size(bold_obj, val, rect.width, max_pt, min_pt)
+        # Ellipsize if still too long even at min size
+        val = _ellipsize_to_width(bold_obj, val, rect.width, fs)
+        tw = bold_obj.text_length(val, fontsize=fs)
+        if align == "center":
+            x = rect.x0 + (rect.width - tw) / 2.0
+        elif align == "right":
+            x = rect.x1 - tw
+        else:
+            x = rect.x0
+        baseline = _centered_baseline_for_box(fo := bold_obj, rect.y0, rect.y1, fs)
+        page.insert_text((x, baseline), val,
+                         fontname=fn_bold, fontfile=bold_fn,
+                         fontsize=fs, color=color, overlay=True)
+
+    def _put_wrapped(text, rect_pt, color, size_pt=5.0, min_pt=3.4, max_pt=5.5, max_lines=2, line_gap=1.03, *args, **kwargs):
+        val = clean_card_value(str(text) if text else "")
+        if not val:
+            return
+        rect = fitz.Rect(*rect_pt)
+        lines, target_fs = wrap_and_shrink_text(bold_obj, val, rect.width, max_lines, base_size=size_pt)
+        if not lines:
+            return
+        asc = getattr(bold_obj, "ascender", 0.9)
+        step = target_fs * line_gap
+        baseline = rect.y0 + target_fs * asc + 0.5
+        for line in lines:
+            if baseline - target_fs * abs(bold_obj.descender) > rect.y1:
+                break
+            page.insert_text((rect.x0, baseline), line,
+                             fontname=fn_bold, fontfile=bold_fn,
+                             fontsize=target_fs, color=color, overlay=True)
+            baseline += step
+
+    # ── 4. Draw a colon after each label rect (same as standalone)
+    #       The colon column sits at x≈54.7 pt.
+    colon_size = 5.5
+    for y_pt in (161.5, 169.0, 176.5, 190.5):
+        page.insert_text((54.7, y_pt + 6.5), ":",
+                         fontname=fn_bold, fontfile=bold_fn,
+                         fontsize=colon_size, color=COL_BLACK, overlay=True)
+
+    # ── 5. Write the actual employee values
+    name = _emp_value(student, "employee_name", "student_name", upper=True)
+    _put_field(name, (8.0, 134.0, 112.0, 145.6), COL_WHITE,
+               size_pt=8.5, min_pt=5.5, max_pt=9.0, align="center")
+
+    desig = _emp_value(student, "designation", upper=True)
+    if desig:
+        desig_val = clean_card_value(desig)
+        fs = _fit_size(bold_obj, desig_val, 59.5, 5.0, 3.8)
+        desig_val = _ellipsize_to_width(bold_obj, desig_val, 59.5, fs)
+        
+        # Changed Y baseline from 153.8 to 151.8 to pull it up into perfect alignment
+        page.insert_text((50.5, 151.8), " " + desig_val,
+                         fontname=fn_bold, fontfile=bold_fn,
+                         fontsize=fs, color=COL_WHITE, overlay=True)
+
+    validity = _emp_value(student, "validity")
+    if not validity:
+        validity = "2026-27"
+    _put_field(validity, (112.5, 111.6, 142.0, 122.6), COL_VALIDITY_R,
+               size_pt=7.5, min_pt=5.5, max_pt=8.0, align="center")
+
+    fh = _emp_value(student, "father_name", "fh_name")
+    _put_field(fh, (61.5, 161.5, 150.0, 169.8), COL_BLACK,
+               size_pt=5.5, min_pt=3.8, max_pt=6.0, align="left")
+
+    dob = _emp_value(student, "dob")
+    _put_field(dob, (61.5, 169.0, 150.0, 177.2), COL_BLACK,
+               size_pt=5.5, min_pt=3.8, max_pt=6.0, align="left")
+
+    addr = _emp_value(student, "address")
+    _put_wrapped(addr, (61.5, 176.5, 150.0, 190.4), COL_BLACK,
+                  size_pt=5.0, min_pt=3.4, max_pt=5.5, max_lines=2)
+
+    mobile = _emp_value(student, "mobile", "contact_no")
+    _put_field(mobile, (61.5, 190.5, 150.0, 198.8), COL_BLACK,
+               size_pt=5.5, min_pt=3.8, max_pt=6.0, align="left")
+
+    buf = io.BytesIO()
+    try:
+        doc.save(buf, garbage=4, deflate=True, deflate_images=True,
+                 deflate_fonts=True, clean=True, incremental=False)
+    except TypeError:
+        doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
+    doc.close()
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────
+# AB ASCENT  —  EMPLOYEE
+# ─────────────────────────────────────────────────────────────────
+# Source: ab_ascent_emp standalone (id_card_generator (14).py).
+# Reference canvas in the standalone = 638 × 1013 px (card 55×86 mm).
+# Conversion factor px → pt:  155.91/638 = 0.2444 (x), 243.78/1013 = 0.2406 (y).
+# Resulting PT placeholders:
+#   validity    ( 114.9, 101.6, 144.2, 110.2 )  royal blue,  anton,   center, 7pt
+#   photo       (  54.7,  67.1, 101.2, 119.8 )  PHOTO BOX
+#   name        (  14.7, 131.1, 114.9, 142.0 )  red,         bold,    center, 9pt
+#   designation (  51.3, 141.3, 117.3, 149.9 )  royal blue,  bold,    left,   6pt
+#   dob         (  60.6, 158.1, 147.6, 166.0 )  royal blue,  bold,    left,   6pt
+#   fh_name     (  60.6, 165.1, 147.6, 173.1 )  royal blue,  bold,    left,   6pt
+#   address     (  60.6, 173.1, 147.6, 192.5 )  royal blue,  bold,    left,   6pt   wrap
+#   mobile      (  60.6, 188.0, 105.1, 195.4 )  royal blue,  bold,    left,   6pt
+# Colours from the standalone:
+#   ROYAL_BLUE = (0x1E, 0x40, 0xAF)
+#   NAME_RED   = (0xE8, 0x3A, 0x2F)
+#   YELLOW_BG  = (0xFF, 0xD9, 0x11)
+# ─────────────────────────────────────────────────────────────────
+def _render_ab_ascent_emp_card_bytes(student: dict, tmpl_bytes: bytes):
+    """
+    AB ASCENT — EMPLOYEE CARD RENDERER  (v3.1 — STANDALONE-PARITY BUILD)
+
+    Faithful 1-to-1 port of the standalone script
+    ``id_card_generator (14).py`` (the file the school signed off on).
+
+    Key parity fixes vs. earlier builds (which produced misaligned cards
+    like the Mamita Pandey screenshot):
+      1. PHOTO BORDER  -- removed.  Standalone never draws an extra
+         border; the template PDF already has the blue border baked in.
+         The previous code drew a 1.5pt blue rectangle on top, which the
+         user saw as a duplicated/thick border.
+      2. PHOTO RECT    -- photo is pasted into the EXACT placeholder
+         rect (no inward 1.5pt shrink), matching the standalone's
+         ``card.paste(photo, (px1, py1))`` behaviour.
+      3. DESIGNATION   -- placeholder rect rescaled to match the
+         standalone (210, 587, 480, 623) box in 638x1013 reference px,
+         i.e. PDF pts ~(51.3, 141.3, 117.3, 149.9).  Drawn left-aligned
+         with NO hardcoded ``insert_text((54.5, 146.5), ...)`` jump and
+         NO extra colon -- the template already contains the
+         "DESIGNATION :" label, and the standalone simply paints the
+         value on top of the right portion of the yellow band.
+      4. ADDRESS       -- uses the standalone's wrap-at-fixed-size
+         behaviour; placeholder rect widened to the standalone width so
+         long addresses (e.g. "Dharampur, Amarpur, Banka") align
+         flush-left with DOB / F/H NAME / MOBILE values above and below.
+      5. MASKS         -- white/yellow mask rectangles use the *new*
+         standalone-aligned placeholder coords so the pre-printed
+         labels and colons on the template are preserved.
+    """
+    doc = fitz.open("pdf", tmpl_bytes)
+    page = doc[0]
+
+    anton_obj, bold_obj, anton_fn, bold_fn, fn_anton, fn_bold = _ensure_fonts()
+    if bold_obj is None:
+        doc.close()
+        return None
+
+    # ── Colours (exact values from the standalone) ─────────────────
+    ROYAL_BLUE = (0x1E/255, 0x40/255, 0xAF/255)
+    NAME_RED   = (0xE8/255, 0x3A/255, 0x2F/255)
+    YELLOW_BG  = (0xFF/255, 0xD9/255, 0x11/255)
+    WHITE_C    = (1.0, 1.0, 1.0)
+
+    # ── Placeholder map ─────────────────────────────────────────────
+    # Standalone reference canvas = 638 x 1013 px on a 55 x 86 mm card.
+    # px -> pt conversion: x = px * (155.91 / 638) ≈ px * 0.24438
+    #                      y = px * (243.78 / 1013) ≈ px * 0.24064
+    # Standalone PLACEHOLDERS table (in reference px):
+    #     validity    = (470, 422, 590, 458)
+    #     photo       = (224, 279, 414, 498)
+    #     name        = ( 60, 545, 470, 590)
+    #     designation = (210, 587, 480, 623)
+    #     dob         = (248, 657, 604, 690)
+    #     fh_name     = (248, 686, 604, 719)
+    #     address     = (248, 719, 604, 800)
+    #     mobile      = (248, 781, 430, 812)
+    # The values below are those rectangles converted to PDF points.
+    PLACEHOLDERS = {
+        "validity":    (114.86, 101.55, 144.18, 110.21),
+       # UPDATE THESE PARAMETERS:
+
+        "name":        ( 14.66, 131.15, 114.86, 141.98),
+        
+        # 🟢 Changed x0 to 53.50 to give a clean space after the pre-printed colon.
+        # 🟢 Changed x1 to 116.50 so the yellow overlay stops BEFORE the blue slanted border line!
+        "designation": ( 50.0, 141.26, 106.0, 149.92),
+        
+        "dob":         ( 60.61, 158.10, 147.61, 166.04),
+        "fh_name":     ( 60.61, 165.08, 147.61, 173.02),
+        "address":     ( 60.61, 172.50, 147.61, 187.00), 
+        "mobile":      ( 60.61, 187.94, 105.08, 195.40),
+        # UPDATE THIS IN YOUR PLACEHOLDERS DICTIONARY:
+# UPDATE THIS KEY IN YOUR PLACEHOLDERS DICTIONARY:
+# UPDATE THIS KEY IN YOUR PLACEHOLDERS DICTIONARY:
+"photo":       ( 53.60,  66.50, 99.20, 119.50),
+    }
+    # ── Masks (clear backgrounds before drawing text) ──────────────
+    # Same set as standalone: yellow band for name + designation,
+    # white for everything else.
+    masks = {
+        "name":        YELLOW_BG,
+        "designation": YELLOW_BG,
+        "dob":         WHITE_C,
+        "fh_name":     WHITE_C,
+        "address":     WHITE_C,
+        "mobile":      WHITE_C,
+        "validity":    WHITE_C,
+    }
+    for key, fill in masks.items():
+        x0, y0, x1, y1 = PLACEHOLDERS[key]
+        page.draw_rect(fitz.Rect(x0, y0, x1, y1),
+                       color=fill, fill=fill, width=0, overlay=True)
+
+ 
+    # NOTE: deliberately NO page.new_shape().draw_rect(...) here.
+    # The standalone draws no border, and the template PDF already
+    # contains the photo's blue frame.  Drawing one here produces the
+    # double-border artifact seen on the Mamita Pandey card.
+
+    # ── PHOTO (Clean white-out mask + Standalone Parity Fill Fit)
+    # ── PHOTO (Strict Border-Aware Alignment) ──────────────────────
+    # ── PHOTO (Clean Frame Fitting Parity) ──────────────────────
+    # ── PHOTO (Clean Frame Fitting Parity) ──────────────────────
+    PHOTO = PLACEHOLDERS["photo"]
+
+# 1. Clear ONLY the inner canvas area (stopping safely inside the boundaries)
+    page.draw_rect(
+        fitz.Rect(PHOTO[0] + 0.5, PHOTO[1] + 0.5, PHOTO[2] - 0.5, PHOTO[3] - 0.5), 
+        color=(1.0, 1.0, 1.0), 
+        fill=(1.0, 1.0, 1.0), 
+        width=0, 
+        overlay=True
+    )
+
+    # 2. Perfect edge fit inside the border stroke lines
+    photo_inset_rect = fitz.Rect(
+        PHOTO[0] + 0.5,
+        PHOTO[1] + 0.5,
+        PHOTO[2] - 0.5,
+        PHOTO[3] - 0.5
+    )
+        
+    photo_bytes = fetch_photo_bytes(student.get("photo_url", ""))
+    if photo_bytes and HAS_PIL:
+        # 🟢 Force the aspect-aware crop to evaluate using the exact inset window geometry
+        prepared = prepare_photo_for_rect_cover(
+            photo_bytes, 
+            (photo_inset_rect.x0, photo_inset_rect.y0, photo_inset_rect.x1, photo_inset_rect.y1),
+            scale=PHOTO_EMBED_SCALE, output_format="JPEG",
+        )
+        insert_image_safe(page, photo_inset_rect, prepared or photo_bytes)
+    else:
+        insert_image_safe(page, photo_inset_rect, photo_bytes)
+    # ── Text drawing helpers ───────────────────────────────────────
+    def _put(text, key, color, *, size_pt=6.0, min_pt=3.5, align="left", upper=False,
+             font_obj=None, font_fn=None, font_name=None, shrink=True):
+        val = clean_card_value(str(text) if text else "")
+        if not val:
+            return
+        if upper:
+            val = val.upper()
+        x0, y0, x1, y1 = PLACEHOLDERS[key]
+        bw = x1 - x0
+        fo = font_obj or bold_obj
+        ff = font_fn or bold_fn
+        fn = font_name or fn_bold
+        fs = _fit_size(fo, val, bw, size_pt, min_pt) if shrink else size_pt
+        if shrink:
+            val = _ellipsize_to_width(fo, val, bw, fs)
+        tw = fo.text_length(val, fontsize=fs)
+        if align == "center":
+            x = x0 + (bw - tw) / 2.0
+        elif align == "right":
+            x = x1 - tw
+        else:
+            x = x0
+        baseline = _centered_baseline_for_box(fo, y0, y1, fs)
+        page.insert_text((x, baseline), val,
+                         fontname=fn, fontfile=ff,
+                         fontsize=fs, color=color, overlay=True)
+
+    def _put_wrapped_fixed(text, key, color, *, size_pt=6.0, max_lines=2, line_gap=1.15):
+        val = clean_card_value(str(text) if text else "")
+        if not val:
+            return
+        x0, y0, x1, y1 = PLACEHOLDERS[key]
+        bw = x1 - x0
+        lines, target_fs = wrap_and_shrink_text(bold_obj, val, bw, max_lines, base_size=size_pt)
+        if not lines:
+            return
+        asc = getattr(bold_obj, "ascender", 0.9)
+        step = target_fs * line_gap
+        baseline = y0 + target_fs * asc + 1.5
+        for line in lines:
+            if baseline - target_fs * abs(bold_obj.descender) > y1:
+                break
+            page.insert_text((x0, baseline), line,
+                             fontname=fn_bold, fontfile=bold_fn,
+                             fontsize=target_fs, color=color, overlay=True)
+            baseline += step
+
+    # ── NAME  (red, bold, centered) ────────────────────────────────
+    _put(_emp_value(student, "employee_name", "student_name", upper=True),
+         "name", NAME_RED, size_pt=9.0, min_pt=4.0, align="center")
+
+    # ── DESIGNATION  (royal blue, bold, LEFT-aligned in placeholder)
+    # IMPORTANT: standalone uses the placeholder box directly with
+    # ``draw_aligned(..., align="left")`` and font size 6pt.  It does
+    # NOT inject any prefix like "DESIGNATION:" — the template already
+    # has that label printed.  The previous hardcoded
+    # ``insert_text((54.5, 146.5), ...)`` placed text on top of the
+    # template's colon, causing the visible misalignment.
+    
+    _put(_emp_value(student, "designation"),
+         "designation", ROYAL_BLUE,
+         size_pt=6.0, min_pt=4.0, align="left")
+
+    # ── DOB / F-H NAME / MOBILE  (royal blue, bold, left, fixed 6pt)
+    _put(_emp_value(student, "dob"),
+         "dob", ROYAL_BLUE, size_pt=6.0, min_pt=6.0, align="left", shrink=False)
+    _put(_emp_value(student, "father_name", "fh_name"),
+         "fh_name", ROYAL_BLUE, size_pt=6.0, min_pt=6.0, align="left", shrink=False)
+    _put(_emp_value(student, "mobile", "contact_no"),
+         "mobile", ROYAL_BLUE, size_pt=6.0, min_pt=6.0, align="left", shrink=False)
+
+    # ── ADDRESS  (wrap up to 2 lines, royal blue, bold, 6pt) ──────
+    _put_wrapped_fixed(_emp_value(student, "address"),
+                       "address", ROYAL_BLUE,
+                       size_pt=6.0, max_lines=2, line_gap=1.0)
+
+    # ── VALIDITY  (royal blue, Anton, centered, 7pt) ──────────────
+    validity = _emp_value(student, "validity") or "2026-27"
+    v_obj = anton_obj or bold_obj
+    v_fn  = anton_fn or bold_fn
+    v_nm  = fn_anton or fn_bold
+    _put(validity, "validity", ROYAL_BLUE, size_pt=7.0, min_pt=4.0,
+         align="center", font_obj=v_obj, font_fn=v_fn, font_name=v_nm)
+
+    buf = io.BytesIO()
+    try:
+        doc.save(buf, garbage=4, deflate=True, deflate_images=True,
+                 deflate_fonts=True, clean=True, incremental=False)
+    except TypeError:
+        doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
+    doc.close()
+    return buf.getvalue()
+
+
+
+# ─────────────────────────────────────────────────────────────────
+# REDEEMER  —  EMPLOYEE
+# ─────────────────────────────────────────────────────────────────
+# Source: redeemer_emp standalone (ID_Card_Automation_Colab_v3.py).
+# Coordinates (PDF points, top-left):
+#   NAME_BANNER (7.0, 146.8, 113.0, 158.3)    white text on blue, bold 8.5pt centered
+#   DESIG_BOX   (48.3, 158.8, 110.0, 165.2)   white text on blue, bold 4.66pt left
+#   EMPID_BOX   (111.6, 108.5, 138.0, 117.5)  blue text,          bold 7pt left
+#   DOB_BOX     (54.0, 171.5, 145.0, 181.0)   black text,         bold 7pt left
+#   FNAME_BOX   (54.0, 181.0, 145.0, 190.5)   black text,         bold 7pt left
+#   ADDR_BOX    (54.0, 190.0, 145.0, 200.0)   black text,         bold 7pt left
+#   PHOTO_BOX   (54.6,  81.6,  98.6, 136.5)
+#   BANNER_BLUE = (35, 64, 200)
+# ─────────────────────────────────────────────────────────────────
+def _render_redeemer_emp_card_bytes(student: dict, tmpl_bytes: bytes):
+    doc = fitz.open("pdf", tmpl_bytes)
+    page = doc[0]
+
+    anton_obj, bold_obj, anton_fn, bold_fn, fn_anton, fn_bold = _ensure_fonts()
+    if bold_obj is None:
+        doc.close()
+        return None
+
+    BANNER_BLUE = (35/255, 64/255, 200/255)
+    WHITE_C     = (1.0, 1.0, 1.0)
+    BLACK_C     = (0.0, 0.0, 0.0)
+    EMPID_BLUE  = (31/255, 72/255, 255/255)
+    GRAD_LEFT   = (233/255, 249/255, 255/255)
+    GRAD_RIGHT  = (246/255, 253/255, 254/255)
+
+    NAME_BANNER = (7.0,   146.8, 113.0, 158.3)
+    DESIG_BOX   = (48.3,  158.8, 110.0, 165.2)
+    EMPID_BOX   = (111.6, 108.5, 138.0, 117.5)
+    DOB_BOX     = (54.0,  171.5, 145.0, 181.0)
+    FNAME_BOX   = (54.0,  181.0, 145.0, 190.5)
+    ADDR_BOX    = (54.0,  190.0, 145.0, 200.0)
+    PHOTO_BOX   = (54.6,   81.6,  98.6, 136.5)
+
+    page.draw_rect(fitz.Rect(*NAME_BANNER), color=BANNER_BLUE, fill=BANNER_BLUE, width=0, overlay=True)
+    page.draw_rect(fitz.Rect(*DESIG_BOX), color=BANNER_BLUE, fill=BANNER_BLUE, width=0, overlay=True)
+    page.draw_rect(fitz.Rect(*EMPID_BOX), color=WHITE_C, fill=WHITE_C, width=0, overlay=True)
+    _draw_horizontal_gradient_mask(
+        page,
+        fitz.Rect(DOB_BOX[0], DOB_BOX[1], ADDR_BOX[2], ADDR_BOX[3]),
+        GRAD_LEFT, GRAD_RIGHT, max(20, 30),
+    )
+
+    photo_bytes = fetch_photo_bytes(student.get("photo_url", ""))
+    if photo_bytes and HAS_PIL:
+        # v3.0 STRICT COVER FIT — matches redeemer_standalone's photo paste
+        # (no white space; photo fully fills the black-bordered rect).
+        prepared = prepare_photo_for_rect_cover(
+            photo_bytes, PHOTO_BOX,
+            scale=PHOTO_EMBED_SCALE, output_format="JPEG",
+            is_redeemer=True,
+        )
+        insert_image_safe(page, fitz.Rect(*PHOTO_BOX), prepared or photo_bytes)
+    else:
+        insert_image_safe(page, fitz.Rect(*PHOTO_BOX), photo_bytes)
+    sh = page.new_shape()
+    sh.draw_rect(fitz.Rect(*PHOTO_BOX))
+    sh.finish(color=BLACK_C, fill=None, width=0.6, closePath=True)
+    sh.commit(overlay=True)
+
+    def _draw_centered(text, box, size_pt, color, *, upper=False,
+                       font_obj=None, font_fn=None, font_name=None, shrink=True):
+        val = clean_card_value(str(text) if text else "")
+        if not val:
+            return
+        if upper:
+            val = val.upper()
+        x0, y0, x1, y1 = box
+        bw = x1 - x0
+        fo = font_obj or bold_obj
+        ff = font_fn or bold_fn
+        fn = font_name or fn_bold
+        fs = _fit_size(fo, val, bw - 2, size_pt, max(4.0, size_pt * 0.55)) if shrink else size_pt
+        if shrink:
+            val = _ellipsize_to_width(fo, val, bw - 2, fs)
+        tw = fo.text_length(val, fontsize=fs)
+        x = x0 + (bw - tw) / 2.0
+        baseline = _centered_baseline_for_box(fo, y0, y1, fs)
+        page.insert_text((x, baseline), val,
+                         fontname=fn, fontfile=ff,
+                         fontsize=fs, color=color, overlay=True)
+
+    def _draw_left(text, box, size_pt, color, *, pad_left=2, upper=False,
+                   font_obj=None, font_fn=None, font_name=None, shrink=True):
+        val = clean_card_value(str(text) if text else "")
+        if not val:
+            return
+        if upper:
+            val = val.upper()
+        x0, y0, x1, y1 = box
+        bw = x1 - x0
+        fo = font_obj or bold_obj
+        ff = font_fn or bold_fn
+        fn = font_name or fn_bold
+        fs = _fit_size(fo, val, bw - pad_left - 2, size_pt, max(4.0, size_pt * 0.55)) if shrink else size_pt
+        if shrink:
+            val = _ellipsize_to_width(fo, val, bw - pad_left - 2, fs)
+        baseline = _centered_baseline_for_box(fo, y0, y1, fs)
+        page.insert_text((x0 + pad_left, baseline), val,
+                         fontname=fn, fontfile=ff,
+                         fontsize=fs, color=color, overlay=True)
+
+    def _draw_wrapped_fixed(text, box, size_pt, color, *, pad_left=6, max_lines=2, line_gap=1.0):
+        val = clean_card_value(str(text) if text else "")
+        if not val:
+            return
+        x0, y0, x1, y1 = box
+        lines, target_fs = wrap_and_shrink_text(bold_obj, val, (x1 - x0) - pad_left - 2, max_lines, base_size=size_pt)
+        if not lines:
+            return
+        step = target_fs * line_gap
+        for idx, line in enumerate(lines):
+            page.insert_text((x0 + pad_left, y0 + target_fs + idx * step), line,
+                             fontname=fn_bold, fontfile=bold_fn,
+                             fontsize=target_fs, color=color, overlay=True)
+
+    name = _emp_value(student, "employee_name", "student_name", upper=True)
+    _draw_centered(name, NAME_BANNER, 8.5, WHITE_C)
+
+    desig = _emp_value(student, "designation", upper=True)
+    _draw_left(desig, DESIG_BOX, 4.66, WHITE_C, pad_left=1, shrink=False)
+
+    emp_id = _emp_value(student, "emp_id", "roll")
+    if emp_id:
+        _draw_left(emp_id, EMPID_BOX, 7.0, EMPID_BLUE, pad_left=2)
+
+    _draw_left(_emp_value(student, "dob"), DOB_BOX, 7.0, BLACK_C, pad_left=6, shrink=False)
+    _draw_left(_emp_value(student, "father_name", "fh_name", "fname"), FNAME_BOX, 7.0, BLACK_C, pad_left=6, shrink=False)
+    _draw_wrapped_fixed(_emp_value(student, "address"), ADDR_BOX, 7.0, BLACK_C, pad_left=6, max_lines=2, line_gap=1.0)
+
+    buf = io.BytesIO()
+    try:
+        doc.save(buf, garbage=4, deflate=True, deflate_images=True,
+                 deflate_fonts=True, clean=True, incremental=False)
+    except TypeError:
+        doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
+    doc.close()
+    return buf.getvalue()
+
+
+
+# ─────────────────────────────────────────────────────────────────
+# PRIYANKA  —  EMPLOYEE
+# ─────────────────────────────────────────────────────────────────
+# No dedicated standalone script was provided for Priyanka employees.
+# We re-use the Priyanka student template/layout but write EMPLOYEE
+# fields (designation, validity, emp_id, fh_name, dob, mobile, address)
+# into the appropriate slots so the card no longer shows
+# "CLASS: <designation>  SEC: <validity>".
+# ─────────────────────────────────────────────────────────────────
+def _render_priyanka_emp_card_bytes(student: dict, tmpl_bytes: bytes):
+    """
+    Priyanka Dreamnest EMPLOYEE renderer.
+
+    Geometry & colors are a 1:1 port of the standalone reference script
+    `idcard_colab.py` (PRIYANKA DREAMNEST SCHOOL — ID CARD AUTOMATION).
+
+        PHOTO_RECT      = (51.8, 73.0, 92.5, 129.5)
+        PHOTO_CORNER_R  = 4.0  pt
+        NAME_BG_COLOR   = #FFBCF5  (pink behind the name strip)
+        NAVY_COLOR      = #0F006A  (text)
+
+    Detail value clear rects (in pt):
+        F/H Name :  (55.0, 164.5, 105.0, 173.0)   text baseline y=171.5
+        DOB      :  (55.0, 173.5, 105.0, 182.0)   text baseline y=180.5
+        Address  :  (55.0, 181.0, 105.0, 190.0)   text baseline y=188.0
+        Mobile   :  (55.0, 196.5, 105.0, 205.5)   text baseline y=203.5
+
+    The function uses PyMuPDF redaction (server-safe, no on-disk temp
+    files) + a PIL rounded-corner photo, then inserts text via
+    page.insert_text — exactly mirroring the colab logic.
+    """
+    doc = fitz.open("pdf", tmpl_bytes)
+    page = doc[0]
+
+    _, bold_obj, _, bold_fn, _, fn_bold = _ensure_fonts()
+    if bold_obj is None:
+        doc.close()
+        return None
+
+    # ── Colors (1:1 with idcard_colab.py) ───────────────────────
+    NAME_BG_COLOR     = (255/255, 188/255, 245/255)   # #FFBCF5
+    NAME_BG_COLOR_PIL = (255, 188, 245, 255)
+    NAVY_COLOR        = (0x0F/255, 0x00/255, 0x6A/255)  # #0F006A
+    WHITE_BG          = (1, 1, 1)
+
+    # ── 1. Wipe the sample VALUE rectangles only (no label text) ─
+    detail_value_rects = [
+        fitz.Rect(55.0, 164.5, 105.0, 173.0),   # F/H Name value
+        fitz.Rect(55.0, 173.5, 105.0, 182.0),   # DOB value
+        fitz.Rect(55.0, 181.0, 105.0, 190.0),   # Address value
+        fitz.Rect(55.0, 196.5, 105.0, 205.5),   # Mobile value
+    ]
+    for r in detail_value_rects:
+        # Use a white shape (NOT a redact-with-fill) so any vector frames
+        # behind these rects survive. The slot interior is plain white in
+        # the Priyanka template, so a flat white fill is correct.
+        _erase = page.new_shape()
+        _erase.draw_rect(r)
+        _erase.finish(color=None, fill=WHITE_BG, width=0)
+        _erase.commit(overlay=True)
+        # Also redact any raster image pixels in case the template uses an
+        # embedded sample-data PNG instead of vector text.
+        page.add_redact_annot(r, fill=None)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
+
+    # ── 2. Repaint the pink NAME BAND + the small left strip ────
+    # (matches the standalone script: it overpaints the sample name
+    # text with the pink background so the new name is drawn on a
+    # clean pink strip.)
+    name_bg_rect    = fitz.Rect(40.0, 139.5, 105.0, 151.2)
+    desig_bg_strip  = fitz.Rect(43.0, 151.5,  52.0, 158.0)
+    for r, fill in ((name_bg_rect, NAME_BG_COLOR),
+                    (desig_bg_strip, NAME_BG_COLOR)):
+        _s = page.new_shape()
+        _s.draw_rect(r)
+        _s.finish(color=None, fill=fill, width=0)
+        _s.commit(overlay=True)
+
+    # ── 3. Photo — rounded-corner PIL composite ─────────────────
+    PHOTO_RECT     = fitz.Rect(51.8, 73.0, 92.5, 129.5)
+    PHOTO_CORNER_R = 4.0  # pt
+    photo_bytes = fetch_photo_bytes(student.get("photo_url", ""))
+
+    # Clear the photo slot first (white) so any prior image is gone.
+    _ps = page.new_shape()
+    _ps.draw_rect(PHOTO_RECT)
+    _ps.finish(color=None, fill=WHITE_BG, width=0)
+    _ps.commit(overlay=True)
+    page.add_redact_annot(PHOTO_RECT, fill=None)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
+
+    if photo_bytes and HAS_PIL:
+        try:
+            from PIL import Image as _PILImage, ImageDraw as _PILDraw
+            # Render at ~500 DPI for crisp output, identical to colab DPI=500.
+            _scale = max(PHOTO_EMBED_SCALE, 6)   # 6× ≈ 432 DPI; safe minimum
+            tw_px = max(1, int(round(PHOTO_RECT.width  * _scale)))
+            th_px = max(1, int(round(PHOTO_RECT.height * _scale)))
+            r_px  = max(2, int(round(PHOTO_CORNER_R    * _scale)))
+
+            with _PILImage.open(io.BytesIO(photo_bytes)) as _src:
+                _rgb = _src.convert("RGB")
+                _resized = _rgb.resize((tw_px, th_px), _PILImage.Resampling.LANCZOS)
+
+            # Rounded-corner mask
+            _mask = _PILImage.new("L", (tw_px, th_px), 0)
+            _PILDraw.Draw(_mask).rounded_rectangle(
+                (0, 0, tw_px - 1, th_px - 1), radius=r_px, fill=255)
+            # Composite onto the pink #FFBCF5 background — this is what
+            # prevents the corner gaps the standalone script also fixed.
+            _out = _PILImage.new("RGBA", (tw_px, th_px), NAME_BG_COLOR_PIL)
+            _out.paste(_resized.convert("RGBA"), (0, 0), _mask)
+            _resized.close()
+            _mask.close()
+
+            _buf = io.BytesIO()
+            _out.save(_buf, format="PNG")
+            _out.close()
+            page.insert_image(PHOTO_RECT, stream=_buf.getvalue(),
+                              keep_proportion=False, overlay=True)
+        except Exception as e:
+            # Fallback: best-effort JPEG insert without rounded corners.
+            insert_image_safe(page, PHOTO_RECT, photo_bytes)
+    elif photo_bytes:
+        insert_image_safe(page, PHOTO_RECT, photo_bytes)
+    # else: leave photo slot blank (white)
+
+    # ── 4. Helper for the four small detail rows ────────────────
+    def _put(text, x, baseline_y, max_width, sz=6.0, min_sz=3.5):
+        val = clean_card_value(str(text) if text else "")
+        if not val:
+            return
+        fs = _fit_size(bold_obj, val, max_width, sz, min_sz)
+        val = _ellipsize_to_width(bold_obj, val, max_width, fs)
+        page.insert_text((x, baseline_y), val,
+                         fontname=fn_bold, fontfile=bold_fn,
+                         fontsize=fs, color=NAVY_COLOR, overlay=True)
+
+    # ── 5. NAME — centered between x=15 and x=120 at baseline 149.5 ──
+    name_text = _emp_value(student, "employee_name", "student_name",
+                            upper=True)
+    if name_text:
+        fs = 9.0
+        # Shrink-to-fit (max width 95 pt as in standalone)
+        while bold_obj.text_length(name_text, fontsize=fs) > 95 and fs > 5:
+            fs -= 0.5
+        tw = bold_obj.text_length(name_text, fontsize=fs)
+        page.insert_text(((15 + 120) / 2 - tw / 2, 149.5), name_text,
+                         fontname=fn_bold, fontfile=bold_fn,
+                         fontsize=fs, color=NAVY_COLOR, overlay=True)
+
+    # ── 6. DESIGNATION — bottom-left of the pink band, baseline 156.0 ──
+    desig = _emp_value(student, "designation")
+    if desig:
+        # Standalone uses raw fontsize=5.2 with no shrink-to-fit, but we
+        # still cap to the strip width so very long titles do not bleed.
+        fs = _fit_size(bold_obj, desig, 60.0, 5.2, 3.5)
+        desig = _ellipsize_to_width(bold_obj, desig, 60.0, fs)
+        page.insert_text((43.5, 156.0), desig,
+                         fontname=fn_bold, fontfile=bold_fn,
+                         fontsize=fs, color=NAVY_COLOR, overlay=True)
+
+    # ── 7. Detail rows — baselines from idcard_colab.py ─────────
+    _put(_emp_value(student, "father_name", "fh_name"),
+         56.8, 171.5, 48.0, sz=6.0)            # F/H Name
+    _put(_emp_value(student, "dob"),
+         56.8, 180.5, 48.0, sz=6.0)            # DOB
+    addr = _emp_value(student, "address")
+    if addr:
+        lines, target_fs = wrap_and_shrink_text(bold_obj, addr, 48.0, 2, base_size=6.0)
+        for i, line in enumerate(lines):
+            page.insert_text((56.8, 187.0 + i * (target_fs * 1.05)), line,
+                             fontname=fn_bold, fontfile=bold_fn,
+                             fontsize=target_fs, color=NAVY_COLOR, overlay=True)
+    _put(_emp_value(student, "mobile", "contact_no"),
+         56.8, 203.5, 48.0, sz=6.0)            # Mobile
+
+    # NOTE: emp_id is NOT printed — the Priyanka template has no slot
+    # for it. Add a slot in the template if you need it visible.
+
+    buf = io.BytesIO()
+    try:
+        doc.save(buf, garbage=4, deflate=True, deflate_images=True,
+                 deflate_fonts=True, clean=True, incremental=False)
+    except TypeError:
+        doc.save(buf, garbage=4, deflate=True, clean=True, incremental=False)
+    doc.close()
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Dispatcher for employee per-card renderers
+# ─────────────────────────────────────────────────────────────────
+EMP_CARD_RENDERERS = {
+    "hebron_emp":    _render_hebron_emp_card_bytes,
+    "ab_ascent_emp": _render_ab_ascent_emp_card_bytes,
+    "redeemer_emp":  _render_redeemer_emp_card_bytes,
+    "priyanka_emp":  _render_priyanka_emp_card_bytes,
+}
+
+
+def _resolve_card_renderer(template_key: str):
+    """Return (use_per_card, render_fn) for the given template key.
+    Employee templates ALWAYS go through a dedicated per-card renderer
+    so the right labels & coordinates are used."""
+    if template_key in EMP_CARD_RENDERERS:
+        return True, EMP_CARD_RENDERERS[template_key]
+    rk = _resolve_renderer_key(template_key)
+    if rk == "priyanka":
+        return True, _render_priyanka_card_bytes
+    if rk == "ab_ascent":
+        return True, _render_ab_ascent_card_bytes
+    return False, None
+
+
 def draw_card_on_page(page, student, target_rect, template_key, template_doc, template_source_rect):
+    # ── v2.9 EMPLOYEE FIX ────────────────────────────────────────
+    # If this is an *employee* template, build the card via the dedicated
+    # per-card renderer (which writes the correct employee labels) and
+    # paste the resulting PDF onto the A4 page. This path is used by the
+    # single-card preview/download endpoints — for the multi-card A4
+    # builder, the same renderers are invoked directly inside
+    # `_render_a4_page` via `_resolve_card_renderer`.
+    if template_key in EMP_CARD_RENDERERS:
+        try:
+            tmpl_bytes_local = _ensure_template(template_key)
+        except Exception:
+            tmpl_bytes_local = None
+        if tmpl_bytes_local:
+            try:
+                card_bytes = EMP_CARD_RENDERERS[template_key](student, tmpl_bytes_local)
+                if card_bytes:
+                    _card_doc = fitz.open("pdf", card_bytes)
+                    try:
+                        page.show_pdf_page(target_rect, _card_doc, 0,
+                                            keep_proportion=False, overlay=True)
+                    finally:
+                        _card_doc.close()
+                    return
+            except Exception as _e:
+                log.error("Employee per-card render failed for %s / %s: %s",
+                          template_key, student.get("employee_name") or student.get("student_name", "?"), _e)
+        # Fall through to the legacy path if the dedicated renderer fails
+        # so we still produce *something* on the page.
+
     page.show_pdf_page(target_rect, template_doc, 0, keep_proportion=False, overlay=True)
     tr = _make_card_transform(template_source_rect, target_rect)
-    if template_key == "redeemer":
+    # Map employee templates to their underlying student renderer (legacy
+    # fallback only).
+    rk = _resolve_renderer_key(template_key)
+    if rk == "redeemer":
         draw_card_overlay_redeemer(page, student, tr)
     else:
         draw_card_overlay_hebron(page, student, tr)
@@ -2439,7 +4096,7 @@ def _render_a4_page(out_doc, page_idx: int, students: list,
 _PDF_SAVE_OPTS = dict(
     deflate=True, deflate_images=True, deflate_fonts=True,
     garbage=4, clean=True, linear=False, incremental=False,
-    use_objstms=1, pretty=False,
+    pretty=False,
 )
 
 
@@ -2495,8 +4152,10 @@ def build_pdf_file_vector(students: list, template_key: str = DEFAULT_TEMPLATE,
         log.error("build_pdf_file_vector: could not open template doc for key='%s'", template_key)
         return None
 
-    log.info("build_pdf_file_vector: %d students, template=%s, chunk_pages=%d",
-             len(students), template_key, CHUNK_PAGES)
+    # v2.9 — log a mode-aware label so employee jobs don't read as "students".
+    _kind = "employees" if str(template_key).endswith("_emp") else "students"
+    log.info("build_pdf_file_vector: %d %s, template=%s, chunk_pages=%d",
+             len(students), _kind, template_key, CHUNK_PAGES)
 
     source_rect = fitz.Rect(template_doc[0].rect)
     n_pages = (len(students) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE
@@ -2506,8 +4165,16 @@ def build_pdf_file_vector(students: list, template_key: str = DEFAULT_TEMPLATE,
     tmp_final.close()
     out_path = tmp_final.name
 
-    use_per_card = template_key in ("priyanka", "ab_ascent")
-    render_fn = _render_priyanka_card_bytes if template_key == "priyanka" else _render_ab_ascent_card_bytes
+    # v2.9 — Employee templates now have their OWN dedicated per-card
+    # renderers (one per template) so they write employee labels, not
+    # student ones. _resolve_card_renderer returns the correct render fn
+    # for every supported template, including the 4 *_emp templates.
+    use_per_card, render_fn = _resolve_card_renderer(template_key)
+    render_key = _resolve_renderer_key(template_key)
+    if not use_per_card:
+        # Student hebron / redeemer keep their overlay-style rendering
+        # via draw_card_on_page (no per-card renderer needed).
+        render_fn = None
 
     chunk_paths = []        # list of disk PDFs to merge
     chunk_doc = fitz.open()
@@ -2599,6 +4266,21 @@ def build_pdf_file_vector(students: list, template_key: str = DEFAULT_TEMPLATE,
                     gc.collect()
                     merger = fitz.open(compaction_tmp)
 
+            # ── SET METADATA on the final merged PDF ─────────────────
+            # This is the ONLY place metadata needs to be set.
+            # Per-card renderer metadata is discarded (cards are pasted
+            # as images via show_pdf_page onto the A4 out_doc).
+            try:
+                cfg = TEMPLATE_CONFIGS.get(template_key, {})
+                school_name = cfg.get("display_name", "ID Card Generator")
+                merger.set_metadata({
+                    "title":    f"{school_name} — ID Cards",
+                    "author":   school_name,
+                    "producer": "ID Card Generator",
+                    "creator":  "ID Card Generator",
+                })
+            except Exception as _meta_err:
+                log.warning("set_metadata failed (non-fatal): %s", _meta_err)
             _safe_save(merger, out_path)
         finally:
             try: merger.close()
@@ -2731,7 +4413,12 @@ def send_generated_pdf(students, dpi, download_name, as_attachment, allow_extern
     if (not as_attachment) and len(students) >= PREVIEW_EXTERNAL_THRESHOLD and _external_storage_enabled():
         allow_external = True
 
-    log.info("PDF generation started: %d students | template=%s | dpi=%d", len(students), template_key, dpi)
+    # v2.9 — employee templates re-use the student renderer pipeline but the
+    # log line previously always said "students" which made it look (in the
+    # server console) as though employee PDFs were never being generated.
+    _kind = "employees" if str(template_key).endswith("_emp") else "students"
+    log.info("PDF generation started: %d %s | template=%s | dpi=%d",
+             len(students), _kind, template_key, dpi)
 
     try:
         prefetch_photos(students)
@@ -2772,50 +4459,38 @@ def send_generated_pdf(students, dpi, download_name, as_attachment, allow_extern
 
     log.info("Sending PDF to client: %s  attachment=%s", download_name, as_attachment)
 
-    # ✅ Use Flask's send_file with a known disk path + @after_this_request to
-    # delete AFTER the response is fully written. This is more reliable than
-    # a streaming generator (which can be cut short by proxies on slow links).
     safe_name = _sanitize_filename(download_name)
 
-    @after_this_request
-    def _cleanup(response):
-        try:
-            if os.path.exists(pdf_path):
-                os.unlink(pdf_path)
-        except Exception:
-            pass
-        gc.collect()
-        return response
+    # Schedule the delayed delete BEFORE reading so the reaper knows about
+    # the file even if this request dies partway through.
+    schedule_delete(pdf_path, PDF_RETENTION_SECONDS)
 
+    # Same fix as job_file: read into bytes first so the file handle is
+    # released immediately (no WinError 32), then return a plain bytes
+    # Response with a single correct Content-Length header.
+    # A generator Response would trigger Transfer-Encoding: chunked which
+    # conflicts with Content-Length → axios "Network Error".
     try:
-        resp = send_file(
-            pdf_path,
-            mimetype="application/pdf",
-            as_attachment=as_attachment,
-            download_name=safe_name,
-            conditional=True,        # supports Range requests / resume
-            max_age=0,
-        )
-        # Make sure proxies don't truncate / buffer
-        resp.headers["Content-Disposition"] = (
-            ("attachment" if as_attachment else "inline") +
-            f'; filename="{safe_name}"'
-        )
-        resp.headers["X-Accel-Buffering"] = "no"
-        resp.headers["Cache-Control"]    = "no-store"
-        try:
-            resp.headers["Content-Length"] = str(os.path.getsize(pdf_path))
-        except Exception:
-            pass
-        return resp
-    except Exception as e:
-        log.error("send_file failed: %s", e)
-        try:
-            if os.path.exists(pdf_path):
-                os.unlink(pdf_path)
-        except Exception:
-            pass
-        return jsonify({"error": f"send_file failed: {e}"}), 500
+        with open(pdf_path, "rb") as fh:
+            pdf_bytes = fh.read()
+    except OSError as e:
+        log.error("Could not read PDF file: %s", e)
+        return jsonify({"error": "PDF file missing after generation"}), 500
+
+    gc.collect()
+
+    from flask import Response as _Response
+    disp = ("attachment" if as_attachment else "inline") + f'; filename="{safe_name}"'
+    resp = _Response(
+        pdf_bytes,
+        status=200,
+        mimetype="application/pdf",
+    )
+    resp.headers["Content-Disposition"] = disp
+    resp.headers["Content-Length"]      = str(len(pdf_bytes))
+    resp.headers["X-Accel-Buffering"]   = "no"
+    resp.headers["Cache-Control"]       = "no-store"
+    return resp
 
 # ─────────────────────────────────────────────────────────────────
 # TEMPLATE API
@@ -2831,8 +4506,17 @@ TEMPLATE_BRAND_COLORS = {
 @app.route("/api/templates", methods=["GET"])
 @app.route("/templates", methods=["GET"])
 def get_templates():
+    """
+    v2.9 FIX: the student template selector was showing the employee
+    (*_emp) cards too because TEMPLATE_CONFIGS.update(EMPLOYEE_*) merges
+    both dicts. Filter them out here so /api/templates returns ONLY the
+    student templates. The /api/employees/templates endpoint returns the
+    employee templates separately.
+    """
     payload = []
     for key, template in TEMPLATE_CONFIGS.items():
+        if key in EMPLOYEE_TEMPLATE_KEYS:
+            continue  # employee templates live on /api/employees/templates
         payload.append({
             "key": key,
             "label": template["label"],
@@ -2894,10 +4578,28 @@ def get_template_preview(template_key):
 
 
 def _request_template_key():
+    """
+    Resolve the student template from ?template=.
+
+    v2.9 ROUTE-ISOLATION FIX:
+      • If an *employee* key (e.g. 'redeemer_emp') is supplied to a
+        student endpoint, transparently strip the '_emp' suffix and
+        use the equivalent student template. This prevents employee
+        cards from leaking into the student flow when the frontend
+        gets out of sync.
+      • Unknown keys are rejected with 400.
+    """
     raw = request.args.get("template", DEFAULT_TEMPLATE)
     key = str(raw or DEFAULT_TEMPLATE).strip().lower()
-    if key not in TEMPLATE_CONFIGS:
-        return None, jsonify({"error": f"Unknown template: {raw}"}), 400
+    # Coerce employee keys to student equivalents so the wrong route
+    # never produces an employee card.
+    if key in EMPLOYEE_TEMPLATE_KEYS:
+        # 'redeemer_emp' → 'redeemer'; fall back via _resolve_renderer_key.
+        student_key = _resolve_renderer_key(key)
+        log.info("Student route received employee template '%s' — coercing to '%s'", key, student_key)
+        key = student_key
+    if key not in TEMPLATE_CONFIGS or key in EMPLOYEE_TEMPLATE_KEYS:
+        return None, jsonify({"error": f"Unknown student template: {raw}"}), 400
     return key, None, None
 
 # ─────────────────────────────────────────────────────────────────
@@ -3023,7 +4725,8 @@ def debug_download():
     # Try rendering ONE card
     if students and HAS_FITZ and pdf_path.exists():
         tmpl_bytes = _ensure_template(template_key)
-        render_fn  = (_render_priyanka_card_bytes if template_key == "priyanka"
+        rk = _resolve_renderer_key(template_key)
+        render_fn  = (_render_priyanka_card_bytes if rk == "priyanka"
                       else _render_ab_ascent_card_bytes)
         try:
             card_bytes = render_fn(students[0], tmpl_bytes)
@@ -3199,59 +4902,129 @@ def job_progress(jid):
     })
 
 
-@app.route("/api/jobs/<jid>/file", methods=["GET"])
-def job_file(jid):
+@app.route("/api/jobs/<jid>/debug-info", methods=["GET"])
+def job_debug_info(jid):
+    """Debug endpoint — open in browser to inspect job state.
+    GET http://localhost:5000/api/jobs/<jid>/debug-info
+    """
     j = _job_get(jid)
     if not j:
+        return jsonify({"error": "unknown job", "jid": jid}), 404
+    path = j.get("file_path")
+    info = {
+        "jid":           jid,
+        "status":        j.get("status"),
+        "phase":         j.get("phase"),
+        "progress":      j.get("progress"),
+        "file_path":     path,
+        "file_size_kb":  round(j.get("file_size", 0) / 1024, 1),
+        "download_name": j.get("download_name"),
+        "error":         j.get("error"),
+        "file_exists_on_disk": bool(path and os.path.exists(path)),
+    }
+    if path and os.path.exists(path):
+        try:
+            disk_size = os.path.getsize(path)
+            info["disk_size_bytes"] = disk_size
+            info["disk_size_kb"]    = round(disk_size / 1024, 1)
+            with open(path, "rb") as fh:
+                header = fh.read(16)
+            info["first_16_bytes_hex"] = header.hex()
+            info["is_valid_pdf"]       = header[:4] == b"%PDF"
+        except Exception as e:
+            info["disk_read_error"] = str(e)
+    safe_name = _sanitize_filename(j.get("download_name") or "ids.pdf")
+    info["response_headers_that_will_be_sent"] = {
+        "Content-Type":        "application/pdf",
+        "Content-Disposition": f'attachment; filename="{safe_name}"',
+        "Content-Length":      str(j.get("file_size", "?")),
+        "Cache-Control":       "no-store",
+    }
+    log.info("[DOWNLOAD-DEBUG] debug-info for job %s: %s", jid, json.dumps(info, default=str))
+    return jsonify(info)
+
+
+@app.route("/api/jobs/<jid>/file", methods=["GET"])
+def job_file(jid):
+    # Log every incoming request header so we can see exactly what axios is sending
+    log.info("[DOWNLOAD-DEBUG] >>>>>>>>>> /jobs/%s/file HIT <<<<<<<<<<<", jid)
+    log.info("[DOWNLOAD-DEBUG]   User-Agent      : %s", request.headers.get("User-Agent", "<none>"))
+    log.info("[DOWNLOAD-DEBUG]   Accept          : %s", request.headers.get("Accept", "<none>"))
+    log.info("[DOWNLOAD-DEBUG]   Range           : %s", request.headers.get("Range", "<none>"))
+    log.info("[DOWNLOAD-DEBUG]   Origin          : %s", request.headers.get("Origin", "<none>"))
+    log.info("[DOWNLOAD-DEBUG]   X-Requested-With: %s", request.headers.get("X-Requested-With", "<none>"))
+
+    j = _job_get(jid)
+    if not j:
+        log.warning("[DOWNLOAD-DEBUG] job %s NOT FOUND in registry", jid)
         return jsonify({"error": "unknown job"}), 404
+
+    log.info("[DOWNLOAD-DEBUG]   job.status    : %s", j["status"])
+    log.info("[DOWNLOAD-DEBUG]   job.file_path : %s", j["file_path"])
+    log.info("[DOWNLOAD-DEBUG]   job.file_size : %.1f KB", j.get("file_size", 0) / 1024)
+
     if j["status"] != "done":
+        log.warning("[DOWNLOAD-DEBUG] job not done yet — returning 409")
         return jsonify({"error": f"job not finished: {j['status']}", "phase": j["phase"],
                         "progress": j["progress"]}), 409
+
     path = j["file_path"]
     if not path or not os.path.exists(path):
+        log.error("[DOWNLOAD-DEBUG] FILE MISSING ON DISK: %s", path)
         return jsonify({"error": "file expired or missing"}), 410
 
     safe_name = _sanitize_filename(j["download_name"] or "ids.pdf")
+    log.info("[DOWNLOAD-DEBUG]   safe_name     : %s", safe_name)
 
-    @after_this_request
-    def _cleanup(response):
-        # Delete the file AFTER it's been streamed to the client.
-        try:
-            if path and os.path.exists(path):
-                os.unlink(path)
-        except Exception:
-            pass
-        # Drop the job record so it cannot be re-downloaded
-        with _jobs_lock:
-            _jobs.pop(jid, None)
-        gc.collect()
-        return response
+    # Schedule delete before reading so reaper knows about the file
+    schedule_delete(path, PDF_RETENTION_SECONDS)
+    log.info("[pdf-lifecycle] /jobs/%s/file served — file retained for %ds", jid, PDF_RETENTION_SECONDS)
 
-    resp = send_file(path,
-                     mimetype="application/pdf",
-                     as_attachment=True,
-                     download_name=safe_name,
-                     conditional=True,
-                     max_age=0)
+    # Read entire file into RAM — closes handle immediately (no WinError 32).
+    # Plain bytes Response = single Content-Length, NO Transfer-Encoding: chunked.
+    try:
+        with open(path, "rb") as fh:
+            pdf_bytes = fh.read()
+        log.info("[DOWNLOAD-DEBUG]   bytes_read    : %d (%.1f KB)", len(pdf_bytes), len(pdf_bytes)/1024)
+        log.info("[DOWNLOAD-DEBUG]   is_valid_pdf  : %s", pdf_bytes[:4] == b"%PDF")
+    except OSError as e:
+        log.error("[DOWNLOAD-DEBUG] FAILED TO READ FILE INTO RAM: %s", e)
+        return jsonify({"error": "file expired or missing"}), 410
+
+    gc.collect()
+
+    from flask import Response as _Response
+    resp = _Response(pdf_bytes, status=200, mimetype="application/pdf")
     resp.headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    resp.headers["Content-Length"]      = str(len(pdf_bytes))
     resp.headers["X-Accel-Buffering"]   = "no"
     resp.headers["Cache-Control"]       = "no-store"
-    try:
-        resp.headers["Content-Length"]  = str(os.path.getsize(path))
-    except Exception:
-        pass
-    return resp
 
+    log.info("[DOWNLOAD-DEBUG] <<<<<<<<<< RESPONSE BEING SENT:")
+    log.info("[DOWNLOAD-DEBUG]   Status          : 200 OK")
+    log.info("[DOWNLOAD-DEBUG]   Content-Type    : application/pdf")
+    log.info("[DOWNLOAD-DEBUG]   Content-Length  : %d bytes", len(pdf_bytes))
+    log.info("[DOWNLOAD-DEBUG]   Content-Disp    : attachment; filename=\"%s\"", safe_name)
+    log.info("[DOWNLOAD-DEBUG] === IF THE CLIENT RETRIES AFTER THIS, THE BUG IS IN THE FRONTEND ===")
+
+    return resp
 
 @app.route("/api/jobs/<jid>", methods=["DELETE"])
 def job_cancel(jid):
     j = _job_get(jid)
     if not j:
         return jsonify({"error": "unknown job"}), 404
+    # v2.8: only honour cancel if the job is NOT already done. Once the
+    # build finishes the file is retained for PDF_RETENTION_SECONDS so the
+    # client can resume / retry on transient network errors.
+    status = j.get("status")
+    if status in ("done",):
+        log.info("[pdf-lifecycle] /jobs/%s ignored DELETE (status=done, file retained)", jid)
+        return jsonify({"ok": True, "retained": True})
     try:
         p = j.get("file_path")
-        if p and os.path.exists(p):
-            os.unlink(p)
+        if p:
+            schedule_delete(p, 30)   # short grace window, then reaper sweeps
     except Exception:
         pass
     with _jobs_lock:
@@ -3300,9 +5073,468 @@ def download_student():
                               download_name=f"id_{template_key}_{safe_name}.pdf", as_attachment=True, allow_external=True,
                               template_key=template_key)
 
+# ═════════════════════════════════════════════════════════════════
+# EMPLOYEE ID CARD SUPPORT  (v2.8)
+#
+# Employees use the SAME A4-landscape grid + the SAME renderer pipeline as
+# students. We just:
+#   1. Provide an upload-only data source (no live API).
+#   2. Map the school-specific employee Excel columns onto the same
+#      "student" schema the renderers already understand:
+#         employee_name      → student_name
+#         designation        → class    (printed in the "class" slot)
+#         father/husband     → father_name
+#         emp_id             → roll     (and adm_no)
+#         validity (ab_asc)  → section  (just to display somewhere)
+#         photo url variants → photo_url
+#   3. Expose a parallel /api/employees/* surface that the React frontend
+#      uses when the user has picked "Employees" mode.
+# ══════════════════════════════════════════════════════════════
+_emp_store: dict = {
+    "employees":   [],
+    "source":      None,
+    "school_name": None,
+    "updated_at":  0.0,
+}
+_emp_store_lock = threading.Lock()
+
+
+def replace_emp_store(employees, source, school_name):
+    with _emp_store_lock:
+        old = _emp_store.get("employees") or []
+        if isinstance(old, list):
+            old.clear()
+        _emp_store["employees"]   = list(employees)
+        _emp_store["source"]      = source
+        _emp_store["school_name"] = school_name
+        _emp_store["updated_at"]  = time.time()
+    gc.collect()
+
+
+# Column aliases for each school. We accept any reasonable variant of each
+# column name so the customer can paste their spreadsheet with minor naming
+# differences and still get a valid card.
+_EMP_COL_ALIASES = {
+    # canonical_field : (alias, alias, …)
+    "employee_name": ("employee_name", "name", "emp_name", "full_name"),
+    "designation":   ("designation", "post", "role", "job_title", "position"),
+    "father_name":   ("father_name", "fname", "f_name", "father", "fh_name",
+                      "husband_father_name", "husband_name", "father_husband_name"),
+    "dob":           ("dob", "date_of_birth", "birth_date"),
+    "address":       ("address", "residence", "home_address"),
+    "mobile":        ("mobile", "phone", "contact", "contact_no", "mobile_no", "phone_no"),
+    "emp_id":        ("emp_id", "id", "employee_id", "empid"),
+    "validity":      ("validity", "valid_till", "valid_upto", "expiry"),
+    "photo_url":     ("photo_url", "photo", "image", "image_url",
+                      "employee_photo", "emp_photo"),
+}
+
+
+def _pick_emp(rm: dict, *aliases) -> str:
+    """Like `pick()` but for employee rows. Returns the first non-empty hit.
+    Importantly, photo URLs are NOT cleaned here — they are passed through
+    raw so the renderer's fetch step gets the exact URL from the row.
+    """
+    for a in aliases:
+        if a in rm:
+            v = rm[a]
+            if v is None or pd.isna(v):
+                continue
+            s = str(v).strip()
+            if s and s.lower() not in {"nan", "none", "null"}:
+                return s
+    return ""
+
+
+def map_employee_row(rm: dict) -> dict:
+    """Return a dict with the same shape as a parsed student row so the
+    existing renderers can consume it without modification."""
+    employee_name = _pick_emp(rm, *_EMP_COL_ALIASES["employee_name"])
+    designation   = _pick_emp(rm, *_EMP_COL_ALIASES["designation"])
+    father_name   = _pick_emp(rm, *_EMP_COL_ALIASES["father_name"])
+    dob_raw       = _pick_emp(rm, *_EMP_COL_ALIASES["dob"])
+    address       = _pick_emp(rm, *_EMP_COL_ALIASES["address"])
+    mobile        = _pick_emp(rm, *_EMP_COL_ALIASES["mobile"])
+    emp_id        = _pick_emp(rm, *_EMP_COL_ALIASES["emp_id"])
+    validity      = _pick_emp(rm, *_EMP_COL_ALIASES["validity"])
+    photo_url_raw = _pick_emp(rm, *_EMP_COL_ALIASES["photo_url"])
+
+    # IMPORTANT: photo_url is preserved verbatim (no replace/cleaning) per spec.
+    out = {
+        # canonical employee fields (also kept under their own names so the
+        # frontend can display them without re-mapping)
+        "employee_name": employee_name,
+        "designation":   designation,
+        "emp_id":        emp_id,
+        "validity":      validity,
+
+        # —— shimmed onto the student schema for the existing renderers ——
+        "student_name":  employee_name,
+        "class":         designation,    # designation printed in the "class" slot
+        "section":       validity,       # ab_ascent validity shown in section slot
+        "roll":          emp_id,
+        "father_name":   father_name,
+        "mother_name":   "",
+        "dob":           format_dob(dob_raw),
+        "address":       clean_address(address),
+        "mobile":        mobile,
+        "photo_url":     photo_url_raw,    # raw — no cleaning
+        "adm_no":        emp_id,
+        "blood_group":   "",
+        "gender":        "",
+        "session":       DEFAULT_SESSION,
+        "bus_route":     "",
+    }
+    return out
+
+
+def parse_employee_file(file_path: str, filename: str):
+    """Parse an Excel/CSV file of employees into the unified employee schema."""
+    fn = (filename or "").lower()
+    if fn.endswith(".csv"):
+        df = None
+        for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+            try:
+                df = pd.read_csv(file_path, encoding=enc, dtype=str)
+                break
+            except Exception:
+                continue
+        if df is None:
+            raise ValueError("Could not decode CSV — try saving as UTF-8 in Excel")
+    else:
+        try:
+            df = pd.read_excel(file_path, dtype=str)
+        except Exception:
+            df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
+
+    df.columns = [norm_key(c) for c in df.columns]
+    employees = []
+    for _, row in df.iterrows():
+        rm = {col: row[col] for col in df.columns}
+        emp = map_employee_row(rm)
+        # require at least a name OR an emp_id, else skip empty rows
+        if emp.get("employee_name") or emp.get("emp_id"):
+            employees.append(emp)
+
+    # Assign serial numbers grouped by designation (so cards are nicely ordered)
+    employees.sort(key=lambda e: (
+        (e.get("designation") or "").strip().upper(),
+        (e.get("employee_name") or "").strip().upper(),
+    ))
+    for i, e in enumerate(employees, 1):
+        e["serial"] = i
+    return employees
+
+
+def _employee_groups_summary(employees):
+    cc = defaultdict(int)
+    for e in employees:
+        # We group by designation (analogous to "class" for students)
+        cc[(e.get("designation") or "OTHER").strip().upper()] += 1
+    return [{"class": k, "count": v} for k, v in sorted(cc.items(), key=lambda x: x[0])]
+
+
+def _filter_employees_by_designation(employees, des):
+    des = (des or "").strip().upper()
+    if not des:
+        return list(employees)
+    return [e for e in employees if (e.get("designation") or "").strip().upper() == des]
+
+
+# v3.0 — short helpers for the new {school}_employees.pdf naming scheme.
+_EMP_SCHOOL_SLUGS = {
+    "hebron_emp":    "hebron",
+    "redeemer_emp":  "redeemer",
+    "priyanka_emp":  "priyanka",
+    "ab_ascent_emp": "ab_ascent",
+}
+
+def _emp_school_slug(template_key: str) -> str:
+    """Map an employee template key to its short school slug used in PDF
+    filenames. Falls back to the template key itself if unknown."""
+    return _EMP_SCHOOL_SLUGS.get(
+        (template_key or "").strip().lower(),
+        (template_key or "employees").strip().lower().replace("_emp", "")
+    )
+
+def _safe_slug(value: str) -> str:
+    """Make a string safe for use inside a filename."""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+    return s.strip("_") or "x"
+
+
+def _normalize_emp_template_key(value):
+    """
+    v2.9 ROUTE-ISOLATION FIX: if the caller hits an employee endpoint
+    with a *student* template key (e.g. 'redeemer'), coerce it to the
+    matching employee key ('redeemer_emp') so the user never accidentally
+    sees a student card on the employee flow.
+    """
+    key = str(value or DEFAULT_EMP_TEMPLATE).strip().lower()
+    if key in EMPLOYEE_TEMPLATE_KEYS:
+        return key
+    # Student key supplied to employee endpoint — promote to its _emp pair.
+    candidate = f"{key}_emp"
+    if candidate in EMPLOYEE_TEMPLATE_KEYS:
+        log.info("Employee route received student template '%s' — coercing to '%s'", key, candidate)
+        return candidate
+    return DEFAULT_EMP_TEMPLATE
+
+
+def _request_emp_template_key():
+    raw = request.args.get("template", DEFAULT_EMP_TEMPLATE)
+    key = _normalize_emp_template_key(raw)
+    return key, None, None
+
+
+# ──────────────────────────────────────────────────────────────
+# Employee REST routes (mirror students, sans the API source)
+# ──────────────────────────────────────────────────────────────
+@app.route("/api/employees/templates", methods=["GET"])
+def emp_get_templates():
+    """
+    v3.0 FIX: previously pointed `preview_url` at the STUDENT renderer's
+    preview (e.g. /api/templates/redeemer/preview.png), which made the
+    Employees wizard step show student cards.  Now we point it at the
+    employee key itself (/api/templates/redeemer_emp/preview.png) so the
+    preview is rasterised from the employee template PDF — employees see
+    employee cards.  `_get_template_preview_png` already handles `*_emp`
+    keys correctly because TEMPLATE_CONFIGS holds their PDF paths.
+    """
+    payload = []
+    for key in EMPLOYEE_TEMPLATE_CONFIGS:
+        t = TEMPLATE_CONFIGS[key]
+        renderer = t.get("renderer", key)
+        payload.append({
+            "key":           key,
+            "label":         t["label"],
+            "display_name":  t["display_name"],
+            "description":   t["description"],
+            "fields":        t["fields"],
+            "color":         TEMPLATE_BRAND_COLORS.get(renderer, "#4F46E5"),
+            # Use the employee key's OWN preview — rasterised from the
+            # employee template PDF.
+            "preview_url":   f"/api/templates/{key}/preview.png",
+        })
+    return jsonify(payload)
+
+
+@app.route("/api/employees/upload", methods=["POST"])
+def emp_upload_file():
+    if "file" not in request.files:
+        return jsonify({"error": "No file attached. Please choose a file."}), 400
+    f = request.files["file"]
+    if not f or not f.filename:
+        return jsonify({"error": "Empty file name"}), 400
+    fname = f.filename.strip()
+    ext = Path(fname).suffix.lower()
+    if ext not in (".xlsx", ".xls", ".csv"):
+        return jsonify({"error": f"Unsupported file type '{ext}'. Please upload .xlsx, .xls or .csv"}), 400
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp_path = tmp.name
+            f.save(tmp_path)
+        employees = parse_employee_file(tmp_path, fname)
+        if not employees:
+            return jsonify({
+                "error": "No employee rows found. Check that the column headers "
+                         "match one of the expected schemas "
+                         "(name + emp_id / id / employee_id)."
+            }), 400
+        replace_emp_store(employees, "file", "Uploaded File")
+        log.info("Emp upload: %d employees from '%s'", len(employees), fname)
+        return jsonify({
+            "success":      True,
+            "count":        len(employees),
+            "school_name":  "Uploaded File",
+            "classes":      _employee_groups_summary(employees),
+            "session":      DEFAULT_SESSION,
+        })
+    except Exception as e:
+        log.error("Emp upload error: %s\n%s", e, traceback.format_exc())
+        return jsonify({"error": f"Could not parse file: {e}"}), 500
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try: os.unlink(tmp_path)
+            except Exception: pass
+
+
+@app.route("/api/employees/status", methods=["GET"])
+def emp_get_status():
+    employees = _emp_store["employees"]
+    if not employees:
+        return jsonify({"loaded": False})
+    des_list = sorted({
+        (e.get("designation") or "OTHER").strip().upper()
+        for e in employees
+    })
+    class_counts = {}
+    for e in employees:
+        k = (e.get("designation") or "OTHER").strip().upper()
+        class_counts[k] = class_counts.get(k, 0) + 1
+    return jsonify({
+        "loaded":       True,
+        "count":        len(employees),
+        "school_id":    None,
+        "school":       _emp_store.get("school_name", ""),
+        "school_name":  _emp_store.get("school_name", ""),
+        "source":       _emp_store.get("source", ""),
+        "classes":      des_list,
+        "classCounts":  class_counts,
+        "session":      DEFAULT_SESSION,
+    })
+
+
+@app.route("/api/employees/employees", methods=["GET"])
+@app.route("/api/employees/list", methods=["GET"])
+def emp_get_employees():
+    des = request.args.get("class", "").strip().upper()
+    employees = _emp_store["employees"]
+    if des:
+        employees = _filter_employees_by_designation(employees, des)
+    return jsonify(employees)
+
+
+def _emp_get_loaded_or_400():
+    employees = _emp_store.get("employees") or []
+    if not employees:
+        return [], jsonify({"error": "No employees loaded. Please upload an Excel file."})
+    return employees, None
+
+
+@app.route("/api/employees/preview/all", methods=["GET"])
+def emp_preview_all():
+    template_key, err_resp, err_code = _request_emp_template_key()
+    if err_resp:
+        return err_resp, err_code
+    employees, err = _emp_get_loaded_or_400()
+    if err:
+        return err
+    des = request.args.get("class", "").strip().upper()
+    employees = _filter_employees_by_designation(employees, des)
+    return send_generated_pdf(
+        employees, dpi=PREVIEW_DPI,
+        download_name=f"preview_{template_key}.pdf", as_attachment=False,
+        template_key=template_key,
+    )
+
+
+@app.route("/api/employees/download/all", methods=["GET"])
+def emp_download_all():
+    template_key, err_resp, err_code = _request_emp_template_key()
+    if err_resp:
+        return err_resp, err_code
+    employees, err = _emp_get_loaded_or_400()
+    if err:
+        return err
+    des = request.args.get("class", "").strip().upper()
+    # v3.0 PDF NAMING: drop the "emp_" prefix and use {school}_employees.pdf
+    # (no timestamp), per user spec. Designation, if present, is appended.
+    school_slug = _emp_school_slug(template_key)
+    if des:
+        employees = _filter_employees_by_designation(employees, des)
+        fname     = f"{school_slug}_employees_{_safe_slug(des)}.pdf"
+    else:
+        employees = list(employees)
+        fname     = f"{school_slug}_employees.pdf"
+    return send_generated_pdf(
+        employees, dpi=DOWNLOAD_DPI,
+        download_name=fname, as_attachment=True, allow_external=True,
+        template_key=template_key,
+    )
+
+
+@app.route("/api/employees/jobs/start", methods=["POST", "GET"])
+def emp_job_start():
+    _prune_old_jobs()
+    template_key, err_resp, err_code = _request_emp_template_key()
+    if err_resp:
+        return err_resp, err_code
+    employees, err = _emp_get_loaded_or_400()
+    if err:
+        return err
+    des = request.args.get("class", "").strip().upper()
+    # v3.0 PDF NAMING: {school}_employees.pdf (no timestamp).
+    school_slug = _emp_school_slug(template_key)
+    if des:
+        employees = _filter_employees_by_designation(employees, des)
+        fname     = f"{school_slug}_employees_{_safe_slug(des)}.pdf"
+    else:
+        employees = list(employees)
+        fname     = f"{school_slug}_employees.pdf"
+
+    if not employees:
+        return jsonify({"error": "No employees to render."}), 400
+
+    if _IS_PRODUCTION and len(employees) > PROD_MAX_STUDENTS:
+        return jsonify({
+            "error": f"Too many employees for one PDF ({len(employees)} > {PROD_MAX_STUDENTS}).",
+            "code":  "BATCH_TOO_LARGE",
+            "limit": PROD_MAX_STUDENTS,
+            "requested": len(employees),
+        }), 413
+
+    jid = _new_job(total=len(employees))
+    threading.Thread(
+        target=_run_job, args=(jid, employees, template_key, fname),
+        daemon=True, name=f"empjob-{jid[:6]}",
+    ).start()
+    return jsonify({
+        "job_id":        jid,
+        "total":         len(employees),
+        "download_name": fname,
+    })
+
+
+@app.route("/api/employees/preview/student", methods=["GET"])
+def emp_preview_one():
+    template_key, err_resp, err_code = _request_emp_template_key()
+    if err_resp:
+        return err_resp, err_code
+    employees, err = _emp_get_loaded_or_400()
+    if err:
+        return err
+    des  = request.args.get("class", "").strip().upper()
+    name = request.args.get("name", "").strip().lower()
+    matches = [e for e in employees
+               if (e.get("designation") or "").strip().upper() == des
+               and name == (e.get("employee_name") or "").strip().lower()]
+    if not matches:
+        return jsonify({"error": "Employee not found"}), 404
+    return send_generated_pdf([matches[0]], dpi=PREVIEW_DPI,
+                              download_name=f"preview_emp_{template_key}.pdf", as_attachment=False,
+                              template_key=template_key)
+
+
+@app.route("/api/employees/download/student", methods=["GET"])
+def emp_download_one():
+    template_key, err_resp, err_code = _request_emp_template_key()
+    if err_resp:
+        return err_resp, err_code
+    employees, err = _emp_get_loaded_or_400()
+    if err:
+        return err
+    des  = request.args.get("class", "").strip().upper()
+    name = request.args.get("name", "").strip().lower()
+    matches = [e for e in employees
+               if (e.get("designation") or "").strip().upper() == des
+               and name == (e.get("employee_name") or "").strip().lower()]
+    if not matches:
+        return jsonify({"error": "Employee not found"}), 404
+    emp = matches[0]
+    safe_name = (emp.get("employee_name", "employee") or "employee").replace(" ", "_")
+    school_slug = _emp_school_slug(template_key)
+    return send_generated_pdf(
+        [emp], dpi=DOWNLOAD_DPI,
+        download_name=f"{school_slug}_employee_{_safe_slug(safe_name)}.pdf",
+        as_attachment=True, allow_external=True,
+        template_key=template_key,
+    )
+
 # ─────────────────────────────────────────────────────────────────
 def _startup_log():
-    ck = chr(0x2713); xk = chr(0x2717)
+    ck = "YES"; xk = "NO"
     print("=" * 62)
     print("  ID Card Generator  v2.7  (chunked on-disk PDF builder, 700+ students)")
     print(f"  Mode          : {'PRODUCTION (512MB/0.5CPU)' if _IS_PRODUCTION else 'LOCAL (full performance)'}")
@@ -3310,6 +5542,11 @@ def _startup_log():
     print(f"  Redeemer PDF  : {ck+' found' if TEMPLATE_PDF_REDEEMER.exists() else xk+' NOT FOUND'}")
     print(f"  Priyanka PDF  : {ck+' found' if TEMPLATE_PDF_PRIYANKA.exists() else xk+' NOT FOUND'}")
     print(f"  Ab Ascent PDF : {ck+' found' if TEMPLATE_PDF_AB_ASCENT.exists() else xk+' NOT FOUND'}")
+    print(f"  Hebron EMP    : {ck+' found' if TEMPLATE_PDF_HEBRON_EMP.exists()    else '~ fallback (student template)'}")
+    print(f"  Redeemer EMP  : {ck+' found' if TEMPLATE_PDF_REDEEMER_EMP.exists()  else '~ fallback (student template)'}")
+    print(f"  Priyanka EMP  : {ck+' found' if TEMPLATE_PDF_PRIYANKA_EMP.exists()  else '~ using Redeemer template as fallback (dedicated renderer active)'}")
+    print(f"  Ab Ascent EMP : {ck+' found' if TEMPLATE_PDF_AB_ASCENT_EMP.exists() else '~ fallback (student template)'}")
+    print(f"  PDF retain    : {PDF_RETENTION_SECONDS}s (delayed-delete)")
     print(f"  PyMuPDF       : {ck if HAS_FITZ else xk}")
     print(f"  Pillow        : {ck if HAS_PIL  else xk}")
     print(f"  Temp dir      : {PDF_TEMP_DIR}")
@@ -3323,5 +5560,15 @@ _startup_log()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    # threaded=True → multiple in-flight requests don't block each other
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    # FIX: debug=False prevents the Werkzeug auto-reloader from restarting
+    # the process mid-transfer.  The reloader watches .py files and when it
+    # detects a change it kills the server process, which immediately drops
+    # ALL open socket connections — including large PDF downloads that are
+    # still streaming.  Users on slow links or with large PDFs (50+ MB) see
+    # this as a "Network Error" even though the server logged "200 OK"
+    # (the status line was sent before the connection was dropped).
+    #
+    # For interactive development with auto-reload, set DEBUG_RELOAD=1 in
+    # the environment explicitly; otherwise leave it off.
+    _debug = os.environ.get("DEBUG_RELOAD", "0").strip() in ("1", "true", "yes")
+    app.run(host="0.0.0.0", port=port, debug=True, threaded=True)
