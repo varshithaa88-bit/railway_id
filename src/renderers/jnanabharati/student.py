@@ -19,7 +19,6 @@ def _rgb(x):
     return ((x >> 16 & 0xFF) / 255.0, (x >> 8 & 0xFF) / 255.0, (x & 0xFF) / 255.0)
 
 CLASS_COLOR = _rgb(0x4570FF)
-
 PLACEHOLDERS = {
     "class_num":    dict(origin=(23.05516, 114.73078), size=15.488, color=CLASS_COLOR, font="archivo"),
     "class_suffix": dict(origin=(33.48307, 107.88457), size= 9.491, color=CLASS_COLOR, font="archivo"),
@@ -27,12 +26,12 @@ PLACEHOLDERS = {
                          align="center", center_x=124.09),
     "name":         dict(origin=( 39.24439, 142.70671), size= 8.996, color=_rgb(0xFFFFFF), font="libSans",
                          align="center", center_x= 76.50),
-    "adm_no":       dict(origin=( 47.98084, 161.29890), size= 5.997, color=_rgb(0x000000), font="libSans"),
-    "father":       dict(origin=( 47.98084, 177.84126), size= 5.997, color=_rgb(0x000000), font="libSans"),
-    "mother":       dict(origin=( 47.70485, 193.49648), size= 5.997, color=_rgb(0x000000), font="libSans"),
-    "dob":          dict(origin=( 47.07488, 209.15173), size= 5.997, color=_rgb(0x000000), font="libSans"),
+    # Fixed left alignment (X=48.0) and shifted upward for vertical alignment
+"adm_no":       dict(origin=( 48.0, 160.6), size= 5.997, color=_rgb(0x000000), font="libSans"),
+    "father":       dict(origin=( 48.0, 176.0), size= 5.997, color=_rgb(0x000000), font="libSans"),
+    "mother":       dict(origin=( 48.0, 191.8), size= 5.997, color=_rgb(0x000000), font="libSans"),
+    "dob":          dict(origin=( 48.0, 207.5), size= 5.997, color=_rgb(0x000000), font="libSans"),
 }
-
 OLD_TEXT = {
     "3", "rd", "AB+", "ROHAN SINGH ", "SUYASH SINGH",
     "POOJA SINGH", "1234", "10-10-2018", "ROHAN SINGH"
