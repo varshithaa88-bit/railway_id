@@ -11,7 +11,7 @@ import io
 from pathlib import Path
 from collections import defaultdict
 
-from flask import Blueprint, request, jsonify, send_file
+from flask import Blueprint, request, jsonify, send_file, Response
 import pandas as pd
 
 from src.config import (
@@ -20,7 +20,7 @@ from src.config import (
 )
 from src.utils.text import clean_card_value
 from src.utils.photo import prefetch_photos, fetch_photo_bytes, prepare_photo_for_rect_cover, insert_image_safe
-from src.utils.pdf import build_id_card_size_pdf, run_job, run_zip_job
+from src.utils.pdf import build_id_card_size_pdf, build_backside_id_card_size_pdf, run_job, run_zip_job, _pdf_to_png_bytes
 from src.jobs import new_job, prune_old_jobs, job_get, schedule_delete
 from src.routes.students import _post_clean_student, format_dob, clean_address, norm_key, send_generated_pdf
 
@@ -309,10 +309,30 @@ def emp_preview_all():
         return err
     des = request.args.get("class", "").strip().upper()
     employees = _filter_employees_by_designation(employees, des)
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
     return send_generated_pdf(
         employees, dpi=PREVIEW_DPI,
-        download_name=f"preview_{template_key}.pdf", as_attachment=False,
-        template_key=template_key,
+        download_name=f"preview_{template_key}_{side}.pdf", as_attachment=False,
+        template_key=template_key, side=side,
+    )
+
+
+@employees_bp.route("/api/employees/preview/backside/all", methods=["GET"])
+def emp_preview_backside_all():
+    template_key, err_resp, err_code = _request_emp_template_key()
+    if err_resp:
+        return err_resp, err_code
+    employees, err = _emp_get_loaded_or_400()
+    if err:
+        return err
+    des = request.args.get("class", "").strip().upper()
+    employees = _filter_employees_by_designation(employees, des)
+    return send_generated_pdf(
+        employees, dpi=PREVIEW_DPI,
+        download_name=f"preview_{template_key}_back.pdf", as_attachment=False,
+        template_key=template_key, side="back",
     )
 
 
@@ -326,16 +346,42 @@ def emp_download_all():
         return err
     des = request.args.get("class", "").strip().upper()
     school_slug = _emp_school_slug(template_key)
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
     if des:
         employees = _filter_employees_by_designation(employees, des)
-        fname     = f"{school_slug}_employees_{_safe_slug(des)}.pdf"
+        fname     = f"{school_slug}_employees_{_safe_slug(des)}_{side}.pdf"
     else:
         employees = list(employees)
-        fname     = f"{school_slug}_employees.pdf"
+        fname     = f"{school_slug}_employees_{side}.pdf"
     return send_generated_pdf(
         employees, dpi=DOWNLOAD_DPI,
         download_name=fname, as_attachment=True, allow_external=True,
-        template_key=template_key,
+        template_key=template_key, side=side,
+    )
+
+
+@employees_bp.route("/api/employees/download/backside/all", methods=["GET"])
+def emp_download_backside_all():
+    template_key, err_resp, err_code = _request_emp_template_key()
+    if err_resp:
+        return err_resp, err_code
+    employees, err = _emp_get_loaded_or_400()
+    if err:
+        return err
+    des = request.args.get("class", "").strip().upper()
+    school_slug = _emp_school_slug(template_key)
+    if des:
+        employees = _filter_employees_by_designation(employees, des)
+        fname     = f"{school_slug}_employees_{_safe_slug(des)}_back.pdf"
+    else:
+        employees = list(employees)
+        fname     = f"{school_slug}_employees_back.pdf"
+    return send_generated_pdf(
+        employees, dpi=DOWNLOAD_DPI,
+        download_name=fname, as_attachment=True, allow_external=True,
+        template_key=template_key, side="back",
     )
 
 
@@ -350,12 +396,15 @@ def emp_job_start():
         return err
     des = request.args.get("class", "").strip().upper()
     school_slug = _emp_school_slug(template_key)
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
     if des:
         employees = _filter_employees_by_designation(employees, des)
-        fname     = f"{school_slug}_employees_{_safe_slug(des)}.pdf"
+        fname     = f"{school_slug}_employees_{_safe_slug(des)}_{side}.pdf"
     else:
         employees = list(employees)
-        fname     = f"{school_slug}_employees.pdf"
+        fname     = f"{school_slug}_employees_{side}.pdf"
 
     if not employees:
         return jsonify({"error": "No employees to render."}), 400
@@ -372,6 +421,7 @@ def emp_job_start():
     jid = new_job(total=len(employees))
     threading.Thread(
         target=run_job, args=(jid, employees, template_key, fname),
+        kwargs={"side": side},
         daemon=True, name=f"empjob-{jid[:6]}",
     ).start()
     return jsonify({
@@ -396,9 +446,32 @@ def emp_preview_one():
                and name == (e.get("employee_name") or "").strip().lower()]
     if not matches:
         return jsonify({"error": "Employee not found"}), 404
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
     return send_generated_pdf([matches[0]], dpi=PREVIEW_DPI,
-                               download_name=f"preview_emp_{template_key}.pdf", as_attachment=False,
-                               template_key=template_key)
+                               download_name=f"preview_emp_{template_key}_{side}.pdf", as_attachment=False,
+                               template_key=template_key, side=side)
+
+
+@employees_bp.route("/api/employees/preview/backside/student", methods=["GET"])
+def emp_preview_backside_one():
+    template_key, err_resp, err_code = _request_emp_template_key()
+    if err_resp:
+        return err_resp, err_code
+    employees, err = _emp_get_loaded_or_400()
+    if err:
+        return err
+    des  = request.args.get("class", "").strip().upper()
+    name = request.args.get("name", "").strip().lower()
+    matches = [e for e in employees
+               if (e.get("designation") or "").strip().upper() == des
+               and name == (e.get("employee_name") or "").strip().lower()]
+    if not matches:
+        return jsonify({"error": "Employee not found"}), 404
+    return send_generated_pdf([matches[0]], dpi=PREVIEW_DPI,
+                               download_name=f"preview_emp_{template_key}_back.pdf", as_attachment=False,
+                               template_key=template_key, side="back")
 
 
 @employees_bp.route("/api/employees/download/student", methods=["GET"])
@@ -419,11 +492,87 @@ def emp_download_one():
     emp = matches[0]
     safe_name = (emp.get("employee_name", "employee") or "employee").replace(" ", "_")
     school_slug = _emp_school_slug(template_key)
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
+    
+    # Check if PNG format requested
+    output_format = request.args.get("format", "pdf").strip().lower()
+    if output_format in ("png", "jpeg", "jpg"):
+        if side == "front":
+            pdf_path = build_id_card_size_pdf(emp, template_key=template_key, skip_flatten=False)
+        else:
+            pdf_path = build_backside_id_card_size_pdf(emp, template_key=template_key, skip_flatten=False)
+        if not pdf_path:
+            return jsonify({"error": "PDF generation failed"}), 500
+        try:
+            png_bytes = _pdf_to_png_bytes(pdf_path, dpi=600)
+            Path(pdf_path).unlink(missing_ok=True)
+            if not png_bytes:
+                return jsonify({"error": "PNG conversion failed"}), 500
+            safe_name_png = f"{safe_name}_{side}.png"
+            resp = Response(png_bytes, status=200, mimetype="image/png")
+            resp.headers["Content-Disposition"] = f'attachment; filename="{safe_name_png}"'
+            resp.headers["Content-Length"] = str(len(png_bytes))
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        except Exception as e:
+            log.error("PNG download error: %s", e)
+            return jsonify({"error": f"PNG generation failed: {e}"}), 500
+    
     return send_generated_pdf(
         [emp], dpi=DOWNLOAD_DPI,
-        download_name=f"{school_slug}_employee_{_safe_slug(safe_name)}.pdf",
+        download_name=f"{school_slug}_employee_{_safe_slug(safe_name)}_{side}.pdf",
         as_attachment=True, allow_external=True,
-        template_key=template_key,
+        template_key=template_key, side=side,
+    )
+
+
+@employees_bp.route("/api/employees/download/backside/student", methods=["GET"])
+def emp_download_backside_one():
+    template_key, err_resp, err_code = _request_emp_template_key()
+    if err_resp:
+        return err_resp, err_code
+    employees, err = _emp_get_loaded_or_400()
+    if err:
+        return err
+    des  = request.args.get("class", "").strip().upper()
+    name = request.args.get("name", "").strip().lower()
+    matches = [e for e in employees
+               if (e.get("designation") or "").strip().upper() == des
+               and name == (e.get("employee_name") or "").strip().lower()]
+    if not matches:
+        return jsonify({"error": "Employee not found"}), 404
+    emp = matches[0]
+    safe_name = (emp.get("employee_name", "employee") or "employee").replace(" ", "_")
+    school_slug = _emp_school_slug(template_key)
+    
+    # Check if PNG format requested
+    output_format = request.args.get("format", "pdf").strip().lower()
+    if output_format in ("png", "jpeg", "jpg"):
+        pdf_path = build_backside_id_card_size_pdf(emp, template_key=template_key, skip_flatten=False)
+        if not pdf_path:
+            return jsonify({"error": "PDF generation failed"}), 500
+        try:
+            png_bytes = _pdf_to_png_bytes(pdf_path, dpi=600)
+            Path(pdf_path).unlink(missing_ok=True)
+            if not png_bytes:
+                return jsonify({"error": "PNG conversion failed"}), 500
+            safe_name_png = f"{safe_name}_back.png"
+            resp = Response(png_bytes, status=200, mimetype="image/png")
+            resp.headers["Content-Disposition"] = f'attachment; filename="{safe_name_png}"'
+            resp.headers["Content-Length"] = str(len(png_bytes))
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        except Exception as e:
+            log.error("PNG download error: %s", e)
+            return jsonify({"error": f"PNG generation failed: {e}"}), 500
+    
+    return send_generated_pdf(
+        [emp], dpi=DOWNLOAD_DPI,
+        download_name=f"{school_slug}_employee_{_safe_slug(safe_name)}_back.pdf",
+        as_attachment=True, allow_external=True,
+        template_key=template_key, side="back",
     )
 
 
@@ -504,15 +653,20 @@ def emp_zip_job_start():
     if output_format == "jpg":
         output_format = "jpeg"
 
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
+
     des = request.args.get("class", "").strip().upper()
     school_slug = _emp_school_slug(template_key)
     fmt_suffix  = "_png" if output_format == "jpeg" else ""
+    side_suffix = f"_{side}" if side == "back" else ""
     if des:
         employees = _filter_employees_by_designation(employees, des)
-        fname     = f"{school_slug}_employees_{_safe_slug(des)}_individual{fmt_suffix}.zip"
+        fname     = f"{school_slug}_employees_{_safe_slug(des)}{side_suffix}_individual{fmt_suffix}.zip"
     else:
         employees = list(employees)
-        fname     = f"{school_slug}_employees_individual{fmt_suffix}.zip"
+        fname     = f"{school_slug}_employees{side_suffix}_individual{fmt_suffix}.zip"
 
     if not employees:
         return jsonify({"error": "No employees to export."}), 400
@@ -521,8 +675,8 @@ def emp_zip_job_start():
     threading.Thread(
         target=run_zip_job,
         args=(jid, employees, template_key, fname, "employee_name", "designation"),
-        kwargs={"output_format": output_format},
+        kwargs={"output_format": output_format, "side": side},
         daemon=True, name=f"empzipjob-{jid[:6]}",
     ).start()
     return jsonify({"job_id": jid, "total": len(employees), "download_name": fname,
-                    "output_format": output_format})
+                    "output_format": output_format, "side": side})

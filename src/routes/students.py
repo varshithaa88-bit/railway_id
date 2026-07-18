@@ -24,7 +24,7 @@ from src.utils.photo import prefetch_photos
 from src.utils.pdf import (
     build_pdf_file, _resolve_pdf_tmp_dir, _sanitize_filename,
     _external_storage_enabled, upload_pdf_to_external_storage,
-    build_id_card_size_pdf, run_job, run_zip_job
+    build_id_card_size_pdf, build_backside_id_card_size_pdf, run_job, run_zip_job, _pdf_to_png_bytes
 )
 from src.jobs import schedule_delete, new_job, prune_old_jobs
 
@@ -483,7 +483,7 @@ def _get_students_or_fetch():
     return [], jsonify({"error": "No students loaded. Please go back and reload student data."})
 
 
-def send_generated_pdf(students, dpi, download_name, as_attachment, allow_external=False, template_key: str = "hebron"):
+def send_generated_pdf(students, dpi, download_name, as_attachment, allow_external=False, template_key: str = "hebron", side="front"):
     if not students:
         return jsonify({"error": "No students loaded"}), 400
     if len(students) > MAX_STUDENTS_PER_REQUEST:
@@ -511,8 +511,8 @@ def send_generated_pdf(students, dpi, download_name, as_attachment, allow_extern
         allow_external = True
 
     _kind = "employees" if str(template_key).endswith("_emp") else "students"
-    log.info("PDF generation started: %d %s | template=%s | dpi=%d",
-             len(students), _kind, template_key, dpi)
+    log.info("PDF generation started: %d %s | template=%s | dpi=%d | side=%s",
+             len(students), _kind, template_key, dpi, side)
 
     try:
         prefetch_photos(students)
@@ -520,7 +520,7 @@ def send_generated_pdf(students, dpi, download_name, as_attachment, allow_extern
         log.warning("prefetch_photos error: %s", e)
 
     try:
-        pdf_path = build_pdf_file(students, dpi=dpi, template_key=template_key)
+        pdf_path = build_pdf_file(students, dpi=dpi, template_key=template_key, side=side)
     except Exception as e:
         log.error("build_pdf_file EXCEPTION: %s", e)
         return jsonify({"error": f"PDF generation exception: {e}"}), 500
@@ -576,9 +576,28 @@ def preview_all():
         return err
     cls      = request.args.get("class","").strip().upper()
     students = filter_students_by_class(students, cls)
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
     return send_generated_pdf(students, dpi=PREVIEW_DPI,
-                               download_name=f"preview_{template_key}.pdf", as_attachment=False,
-                               template_key=template_key)
+                               download_name=f"preview_{template_key}_{side}.pdf", as_attachment=False,
+                               template_key=template_key, side=side)
+
+
+@students_bp.route("/api/preview/backside/all", methods=["GET"])
+@students_bp.route("/preview/backside/all", methods=["GET"])
+def preview_backside_all():
+    template_key, err_resp, err_code = _request_template_key()
+    if err_resp:
+        return err_resp, err_code
+    students, err = _get_students_or_fetch()
+    if err:
+        return err
+    cls      = request.args.get("class","").strip().upper()
+    students = filter_students_by_class(students, cls)
+    return send_generated_pdf(students, dpi=PREVIEW_DPI,
+                               download_name=f"preview_{template_key}_back.pdf", as_attachment=False,
+                               template_key=template_key, side="back")
 
 
 @students_bp.route("/api/download/all", methods=["GET"])
@@ -591,15 +610,39 @@ def download_all():
     if err:
         return err
     cls = request.args.get("class","").strip().upper()
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
     if cls:
         students = filter_students_by_class(students, cls)
-        fname    = f"ids_{template_key}_{cls}.pdf"
+        fname    = f"ids_{template_key}_{cls}_{side}.pdf"
     else:
         students = list(students)
-        fname    = f"ids_{template_key}_ALL.pdf"
+        fname    = f"ids_{template_key}_{side}.pdf"
     return send_generated_pdf(students, dpi=DOWNLOAD_DPI,
-                               download_name=fname, as_attachment=True, allow_external=True,
-                               template_key=template_key)
+                               download_name=fname, as_attachment=True,
+                               template_key=template_key, side=side)
+
+
+@students_bp.route("/api/download/backside/all", methods=["GET"])
+@students_bp.route("/download/backside/all", methods=["GET"])
+def download_backside_all():
+    template_key, err_resp, err_code = _request_template_key()
+    if err_resp:
+        return err_resp, err_code
+    students, err = _get_students_or_fetch()
+    if err:
+        return err
+    cls = request.args.get("class","").strip().upper()
+    if cls:
+        students = filter_students_by_class(students, cls)
+        fname    = f"ids_{template_key}_{cls}_back.pdf"
+    else:
+        students = list(students)
+        fname    = f"ids_{template_key}_back.pdf"
+    return send_generated_pdf(students, dpi=DOWNLOAD_DPI,
+                               download_name=fname, as_attachment=True,
+                               template_key=template_key, side="back")
 
 
 @students_bp.route("/api/preview/student", methods=["GET"])
@@ -618,9 +661,33 @@ def preview_student():
                and name == s.get("student_name","").strip().lower()]
     if not matches:
         return jsonify({"error": "Student not found"}), 404
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
     return send_generated_pdf([matches[0]], dpi=PREVIEW_DPI,
-                               download_name=f"preview_student_{template_key}.pdf", as_attachment=False,
-                               template_key=template_key)
+                               download_name=f"preview_student_{template_key}_{side}.pdf", as_attachment=False,
+                               template_key=template_key, side=side)
+
+
+@students_bp.route("/api/preview/backside/student", methods=["GET"])
+@students_bp.route("/preview/backside/student", methods=["GET"])
+def preview_backside_student():
+    template_key, err_resp, err_code = _request_template_key()
+    if err_resp:
+        return err_resp, err_code
+    students, err = _get_students_or_fetch()
+    if err:
+        return err
+    cls      = request.args.get("class","").strip().upper()
+    name     = request.args.get("name","").strip().lower()
+    matches = [s for s in students
+               if s.get("class","").strip().upper() == cls
+               and name == s.get("student_name","").strip().lower()]
+    if not matches:
+        return jsonify({"error": "Student not found"}), 404
+    return send_generated_pdf([matches[0]], dpi=PREVIEW_DPI,
+                               download_name=f"preview_student_{template_key}_back.pdf", as_attachment=False,
+                               template_key=template_key, side="back")
 
 
 @students_bp.route("/api/download/student", methods=["GET"])
@@ -641,9 +708,82 @@ def download_student():
         return jsonify({"error": "Student not found"}), 404
     student   = matches[0]
     safe_name = student.get("student_name","student").replace(" ","_")
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
+    
+    # Check if PNG format requested
+    output_format = request.args.get("format", "pdf").strip().lower()
+    if output_format in ("png", "jpeg", "jpg"):
+        if side == "front":
+            pdf_path = build_id_card_size_pdf(student, template_key=template_key, skip_flatten=False)
+        else:
+            pdf_path = build_backside_id_card_size_pdf(student, template_key=template_key, skip_flatten=False)
+        if not pdf_path:
+            return jsonify({"error": "PDF generation failed"}), 500
+        try:
+            png_bytes = _pdf_to_png_bytes(pdf_path, dpi=600)
+            Path(pdf_path).unlink(missing_ok=True)
+            if not png_bytes:
+                return jsonify({"error": "PNG conversion failed"}), 500
+            safe_name_png = f"{safe_name}_{side}.png"
+            resp = Response(png_bytes, status=200, mimetype="image/png")
+            resp.headers["Content-Disposition"] = f'attachment; filename="{safe_name_png}"'
+            resp.headers["Content-Length"] = str(len(png_bytes))
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        except Exception as e:
+            log.error("PNG download error: %s", e)
+            return jsonify({"error": f"PNG generation failed: {e}"}), 500
+    
     return send_generated_pdf([student], dpi=DOWNLOAD_DPI,
-                               download_name=f"id_{template_key}_{safe_name}.pdf", as_attachment=True, allow_external=True,
-                               template_key=template_key)
+                               download_name=f"id_{template_key}_{safe_name}_{side}.pdf", as_attachment=True, allow_external=True,
+                               template_key=template_key, side=side)
+
+
+@students_bp.route("/api/download/backside/student", methods=["GET"])
+@students_bp.route("/download/backside/student", methods=["GET"])
+def download_backside_student():
+    template_key, err_resp, err_code = _request_template_key()
+    if err_resp:
+        return err_resp, err_code
+    students, err = _get_students_or_fetch()
+    if err:
+        return err
+    cls      = request.args.get("class","").strip().upper()
+    name     = request.args.get("name","").strip().lower()
+    matches = [s for s in students
+               if s.get("class","").strip().upper() == cls
+               and name == s.get("student_name","").strip().lower()]
+    if not matches:
+        return jsonify({"error": "Student not found"}), 404
+    student   = matches[0]
+    safe_name = student.get("student_name","student").replace(" ","_")
+    
+    # Check if PNG format requested
+    output_format = request.args.get("format", "pdf").strip().lower()
+    if output_format in ("png", "jpeg", "jpg"):
+        pdf_path = build_backside_id_card_size_pdf(student, template_key=template_key, skip_flatten=False)
+        if not pdf_path:
+            return jsonify({"error": "PDF generation failed"}), 500
+        try:
+            png_bytes = _pdf_to_png_bytes(pdf_path, dpi=600)
+            Path(pdf_path).unlink(missing_ok=True)
+            if not png_bytes:
+                return jsonify({"error": "PNG conversion failed"}), 500
+            safe_name_png = f"{safe_name}_back.png"
+            resp = Response(png_bytes, status=200, mimetype="image/png")
+            resp.headers["Content-Disposition"] = f'attachment; filename="{safe_name_png}"'
+            resp.headers["Content-Length"] = str(len(png_bytes))
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        except Exception as e:
+            log.error("PNG download error: %s", e)
+            return jsonify({"error": f"PNG generation failed: {e}"}), 500
+    
+    return send_generated_pdf([student], dpi=DOWNLOAD_DPI,
+                               download_name=f"id_{template_key}_{safe_name}_back.pdf", as_attachment=True, allow_external=True,
+                               template_key=template_key, side="back")
 
 
 @students_bp.route("/api/download/zip", methods=["GET"])
@@ -716,12 +856,15 @@ def job_start():
     if err:
         return err
     cls = request.args.get("class", "").strip().upper()
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
     if cls:
         students = filter_students_by_class(students, cls)
-        fname    = f"ids_{template_key}_{cls}.pdf"
+        fname    = f"ids_{template_key}_{cls}_{side}.pdf"
     else:
         students = list(students)
-        fname    = f"ids_{template_key}_ALL.pdf"
+        fname    = f"ids_{template_key}_{side}.pdf"
 
     if not students:
         return jsonify({"error": "No students to render."}), 400
@@ -741,6 +884,7 @@ def job_start():
     jid = new_job(total=len(students))
     threading.Thread(
         target=run_job, args=(jid, students, template_key, fname),
+        kwargs={"side": side},
         daemon=True, name=f"pdfjob-{jid[:6]}",
     ).start()
     return jsonify({
@@ -766,14 +910,19 @@ def zip_job_start():
     if output_format == "jpg":
         output_format = "jpeg"
 
+    side = request.args.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
+
     cls = request.args.get("class", "").strip().upper()
     fmt_suffix = "_png" if output_format == "jpeg" else ""
+    side_suffix = f"_{side}" if side == "back" else ""
     if cls:
         students = filter_students_by_class(students, cls)
-        fname    = f"student_id_cards_{template_key}_{cls}{fmt_suffix}.zip"
+        fname    = f"student_id_cards_{template_key}_{cls}{side_suffix}{fmt_suffix}.zip"
     else:
         students = list(students)
-        fname    = f"student_id_cards_{template_key}{fmt_suffix}.zip"
+        fname    = f"student_id_cards_{template_key}{side_suffix}{fmt_suffix}.zip"
 
     if not students:
         return jsonify({"error": "No students to export."}), 400
@@ -782,10 +931,10 @@ def zip_job_start():
     threading.Thread(
         target=run_zip_job,
         args=(jid, students, template_key, fname, "student_name", "class"),
-        kwargs={"output_format": output_format},
+        kwargs={"output_format": output_format, "side": side},
         daemon=True, name=f"zipjob-{jid[:6]}",
     ).start()
     return jsonify({"job_id": jid, "total": len(students), "download_name": fname,
-                    "output_format": output_format})
+                    "output_format": output_format, "side": side})
 
 

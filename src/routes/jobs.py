@@ -169,7 +169,7 @@ def job_cancel(jid):
     except Exception:
         pass
     # We remove it from the in-memory jobs registry in jobs module
-    from src.jobs import jobs_registry, _jobs_lock
+    from src.jobs import _jobs, _jobs_lock
     with _jobs_lock:
-        jobs_registry.pop(jid, None)
+        _jobs.pop(jid, None)
     return jsonify({"ok": True})

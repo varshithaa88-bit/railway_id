@@ -3,6 +3,7 @@ import io
 import gc
 import re
 import time
+import threading
 import zipfile
 import logging
 import tempfile
@@ -34,7 +35,7 @@ from src.config import (
     OX_PT, OY_PT, COL_STEP, ROW_STEP, ROW_GAP_PT, COLS, ROWS, CARDS_PER_PAGE,
     PDF_TEMP_DIR, CARD_RENDER_WORKERS, ZIP_BUILD_WORKERS, PREFETCH_WORKERS,
     DOWNLOAD_DPI, CHUNK_PAGES, DEFAULT_TEMPLATE, MM_TO_PT,
-    TEMPLATE_CONFIGS
+    TEMPLATE_CONFIGS, get_backside_template
 )
 
 from src.utils.text import ensure_fonts, clean_card_value
@@ -42,6 +43,43 @@ from src.utils.photo import fetch_photo_bytes, prepare_photo_for_rect_cover
 from src.jobs import job_set, schedule_delete
 
 log = logging.getLogger("idcard.pdf")
+
+# Backside template cache
+_backside_doc_cache = {}
+_backside_doc_locks = {}
+_backside_lock = threading.Lock()
+
+def _get_backside_doc(template_key: str):
+    """Get cached backside template document for a template key."""
+    backside_path = get_backside_template(template_key)
+    if not backside_path or not backside_path.exists():
+        log.warning("Backside template not found for key='%s': %s", template_key, backside_path)
+        return None
+    
+    cache_key = str(template_key).strip().lower()
+    if cache_key in _backside_doc_cache:
+        return _backside_doc_cache[cache_key]
+    
+    with _backside_lock:
+        if cache_key in _backside_doc_cache:
+            return _backside_doc_cache[cache_key]
+        
+        if cache_key not in _backside_doc_locks:
+            _backside_doc_locks[cache_key] = threading.Lock()
+        
+        lock = _backside_doc_locks[cache_key]
+        with lock:
+            if cache_key in _backside_doc_cache:
+                return _backside_doc_cache[cache_key]
+            
+            try:
+                doc = fitz.open(str(backside_path))
+                _backside_doc_cache[cache_key] = doc
+                log.info("Loaded backside template for '%s': %s", template_key, backside_path)
+                return doc
+            except Exception as e:
+                log.error("Failed to load backside template '%s': %s", backside_path, e)
+                return None
 
 # Detect PyMuPDF capabilities dynamically
 def _probe_pymupdf_save_flags() -> dict:
@@ -287,6 +325,174 @@ def _pikepdf_downgrade_to_14(path: str) -> bool:
         return False
 
 
+def _overlay_jnanabharati_backside(page, student: dict, card_x: float, card_y: float):
+    """Overlay Address and Phone for Jnana Bharathi backside cards.
+    
+    Uses the same overlay logic as test.py with correct coordinates and styling.
+    Only affects Jnana Bharathi school. Other schools use static backside.
+    Ensures correct student data mapping - each card uses its own student's data.
+    """
+    import re
+    
+    # Get student data
+    address = str(student.get("address", "")).strip()
+    phone = str(student.get("mobile", "")).strip()
+    
+    # Clean data
+    address = re.sub(r"\s+", " ", address) if address else ""
+    phone = re.sub(r"\s+", "", phone) if phone else ""
+    
+    if not address and not phone:
+        return  # No data to overlay
+    
+    # Coordinates from test.py - these are absolute positions on the card template
+    # Need to offset by card position on the A4 page
+    # Moved RIGHT to unhide semi-colons (increased x coordinates)
+    ADDRESS_RECT = fitz.Rect(59.59, 31.45, 140.50, 46.72)
+    PHONE_RECT = fitz.Rect(59.59, 53.73, 140.50, 61.00)
+    ADDRESS_DRAW_RECT = fitz.Rect(59.59, 30.80, 140.50, 48.20)
+    PHONE_DRAW_RECT = fitz.Rect(59.59, 52.80, 140.50, 62.50)
+    
+    # Offset rects by card position
+    def offset_rect(rect, offset_x, offset_y):
+        return fitz.Rect(
+            rect.x0 + offset_x, rect.y0 + offset_y,
+            rect.x1 + offset_x, rect.y1 + offset_y
+        )
+    
+    address_rect = offset_rect(ADDRESS_RECT, card_x, card_y)
+    phone_rect = offset_rect(PHONE_RECT, card_x, card_y)
+    address_draw_rect = offset_rect(ADDRESS_DRAW_RECT, card_x, card_y)
+    phone_draw_rect = offset_rect(PHONE_DRAW_RECT, card_x, card_y)
+    
+    # Whiteout existing content
+    ERASE_PAD_X = 0.8
+    ERASE_PAD_Y = 0.6
+    BG_COLOR_RGB = (1, 1, 1)
+    
+    def whiteout(rect):
+        r = fitz.Rect(rect.x0 - ERASE_PAD_X, rect.y0 - ERASE_PAD_Y, 
+                      rect.x1 + ERASE_PAD_X, rect.y1 + ERASE_PAD_Y)
+        page.draw_rect(r, color=None, fill=BG_COLOR_RGB, overlay=True)
+    
+    whiteout(address_rect)
+    whiteout(phone_rect)
+    
+    # Font settings from test.py
+    FONT_NAME = "hebo"  # Helvetica-Bold
+    FONT_COLOR_RGB = (0, 0, 0)
+    DEFAULT_ADDRESS_SIZE = 5.6
+    DEFAULT_PHONE_SIZE = 5.6
+    MIN_FONT_SIZE = 3.6
+    LINEHEIGHT_FACTOR = 1.33
+    H_ALIGN = 0  # left align
+    
+    # Text width function
+    def text_width(text, fontsize):
+        return fitz.get_text_length(text, fontname=FONT_NAME, fontsize=fontsize)
+    
+    # Word wrapping function
+    def wrap_words(text, max_width, fontsize):
+        words = text.split()
+        if not words:
+            return [""]
+        lines = []
+        current = words[0]
+        for word in words[1:]:
+            candidate = current + " " + word
+            if text_width(candidate, fontsize) <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+    
+    # Ellipsis function
+    def ellipsize_to_width(text, max_width, fontsize):
+        text = text.strip()
+        if text_width(text, fontsize) <= max_width:
+            return text
+        ellipsis = "..."
+        while text and text_width(text + ellipsis, fontsize) > max_width:
+            text = text[:-1].rstrip()
+        return (text + ellipsis) if text else ellipsis
+    
+    # Fit multiline text (address)
+    def fit_multiline_text(text, rect, max_lines, start_size):
+        if not text:
+            return [""], start_size
+        
+        size = start_size
+        while size >= MIN_FONT_SIZE:
+            lines = wrap_words(text, rect.width, size)
+            if len(lines) <= max_lines:
+                total_height = len(lines) * size * LINEHEIGHT_FACTOR
+                if total_height <= rect.height + 0.15:
+                    return lines, round(size, 2)
+            size = round(size - 0.2, 2)
+        
+        # Still too long at minimum size
+        size = MIN_FONT_SIZE
+        lines = wrap_words(text, rect.width, size)
+        if len(lines) <= max_lines:
+            return lines, round(size, 2)
+        
+        kept = lines[:max_lines]
+        overflow_text = " ".join(lines[max_lines - 1:])
+        kept[-1] = ellipsize_to_width(overflow_text, rect.width, size)
+        return kept, round(size, 2)
+    
+    # Fit single line text (phone)
+    def fit_singleline_text(text, rect, start_size):
+        if not text:
+            return "", start_size
+        size = start_size
+        while size >= MIN_FONT_SIZE:
+            if text_width(text, size) <= rect.width:
+                return text, round(size, 2)
+            size = round(size - 0.2, 2)
+        return ellipsize_to_width(text, rect.width, MIN_FONT_SIZE), round(MIN_FONT_SIZE, 2)
+    
+    # Draw textbox function
+    def draw_textbox(rect, text, fontsize):
+        rc = page.insert_textbox(
+            rect,
+            text,
+            fontsize=fontsize,
+            fontname=FONT_NAME,
+            color=FONT_COLOR_RGB,
+            align=H_ALIGN,
+            lineheight=LINEHEIGHT_FACTOR,
+            overlay=True,
+        )
+        return rc
+    
+    # Overlay Address
+    if address:
+        addr_lines, addr_size = fit_multiline_text(address, address_rect, max_lines=2, start_size=DEFAULT_ADDRESS_SIZE)
+        addr_rc = draw_textbox(address_draw_rect, "\n".join(addr_lines), addr_size)
+        
+        # Fallback if insert_textbox reports overflow
+        if addr_rc < 0:
+            addr_lines, addr_size = fit_multiline_text(address, address_rect, max_lines=2, 
+                                                     start_size=max(addr_size - 0.4, MIN_FONT_SIZE))
+            whiteout(address_rect)
+            draw_textbox(address_draw_rect, "\n".join(addr_lines), addr_size)
+    
+    # Overlay Phone
+    if phone:
+        phone_text, phone_size = fit_singleline_text(phone, phone_rect, start_size=DEFAULT_PHONE_SIZE)
+        phone_rc = draw_textbox(phone_draw_rect, phone_text, phone_size)
+        
+        # Fallback if insert_textbox reports overflow
+        if phone_rc < 0:
+            phone_text, phone_size = fit_singleline_text(phone, phone_rect, 
+                                                        start_size=max(phone_size - 0.4, MIN_FONT_SIZE))
+            whiteout(phone_rect)
+            draw_textbox(phone_draw_rect, phone_text, phone_size)
+
+
 def draw_serial_badge_vector(page, serial: int, cx: float, cy: float, gap_h: float):
     txt    = f"#{serial}"
     fs     = max(5.0, gap_h * 0.38)
@@ -310,6 +516,74 @@ def draw_serial_badge_vector(page, serial: int, cx: float, cy: float, gap_h: flo
         fontname=fn_bold, fontfile=str(bold_fn) if bold_fn else None,
         fontsize=fs, color=(0.14, 0.25, 0.78), overlay=True,
     )
+
+
+def _render_backside_page(out_doc, page_idx: int, num_cards: int, template_key: str, students=None):
+    """Render a backside page with the exact same layout as the front page.
+    
+    For Jnana Bharathi school, overlays Address and Phone from student data.
+    For other schools, renders static backside template only.
+    """
+    backside_doc = _get_backside_doc(template_key)
+    if not backside_doc:
+        log.warning("No backside template available for '%s', skipping backside page", template_key)
+        return
+    
+    try:
+        backside_page = backside_doc[0] if backside_doc.page_count > 0 else None
+        if not backside_page:
+            log.warning("Backside template has no pages for '%s'", template_key)
+            return
+        
+        log.info(f"[backside-render] Rendering page {page_idx} for template '{template_key}' with {num_cards} cards")
+        
+        a4_page = out_doc.new_page(width=A4_W_PT, height=A4_H_PT)
+        
+        # Check if this is Jnana Bharathi (requires student data overlay)
+        is_jnanabharati = str(template_key).strip().lower() == "jnanabharati"
+        log.info(f"[backside-render] Is Jnana Bharathi: {is_jnanabharati}")
+        
+        # Render backside cards in the exact same positions as front
+        for idx in range(num_cards):
+            col = idx % COLS
+            row = idx // COLS
+            card_x = OX_PT + col * COL_STEP
+            card_y = OY_PT + row * ROW_STEP
+            target_rect = fitz.Rect(card_x, card_y, card_x + CARD_W_PT, card_y + CARD_H_PT)
+            
+            # Show the backside template page at the target position
+            a4_page.show_pdf_page(target_rect, backside_doc, 0, keep_proportion=False)
+            
+            # For Jnana Bharathi, overlay Address and Phone from student data
+            if is_jnanabharati and students:
+                student_start = page_idx * CARDS_PER_PAGE
+                student_idx = student_start + idx
+                if student_idx < len(students):
+                    student = students[student_idx]
+                    log.info(f"[backside-render] Card {idx}: Student={student.get('student_name')}, Address={student.get('address')}, Phone={student.get('mobile')}")
+                    _overlay_jnanabharati_backside(a4_page, student, card_x, card_y)
+        
+        # Add serial badges between rows if needed (same as front)
+        if ROWS > 1:
+            for idx in range(num_cards):
+                col = idx % COLS
+                row = idx // COLS
+                card_x = OX_PT + col * COL_STEP
+                card_y = OY_PT + row * ROW_STEP
+                
+                if row == 0:
+                    gap_cy = card_y + CARD_H_PT + ROW_GAP_PT / 2.0
+                else:
+                    gap_cy = card_y - ROW_GAP_PT / 2.0
+                
+                badge_cx = card_x + CARD_W_PT / 2.0
+                draw_serial_badge_vector(
+                    a4_page, page_idx * CARDS_PER_PAGE + idx + 1,
+                    badge_cx, gap_cy, ROW_GAP_PT,
+                )
+        
+    except Exception as e:
+        log.error("Failed to render backside page for '%s': %s", template_key, e)
 
 
 def _render_a4_page(out_doc, page_idx: int, students: list,
@@ -383,8 +657,100 @@ def _render_a4_page(out_doc, page_idx: int, students: list,
         batch_rendered.clear()
 
 
+def build_backside_pdf_file_vector(students: list, template_key: str = DEFAULT_TEMPLATE,
+                                   progress_cb=None):
+    """Generate backside-only PDF."""
+    if not HAS_FITZ:
+        log.error("build_backside_pdf_file_vector: PyMuPDF not installed")
+        return None
+    template_key = str(template_key).strip().lower()
+    
+    log.info(f"[backside-generation] Starting backside generation for template_key='{template_key}'")
+    
+    # Check if backside template exists
+    backside_doc = _get_backside_doc(template_key)
+    if not backside_doc:
+        log.error("build_backside_pdf_file_vector: backside template not found for key='%s'", template_key)
+        return None
+    
+    log.info(f"[backside-generation] Backside template loaded successfully for '{template_key}'")
+
+    _kind = "employees" if str(template_key).endswith("_emp") else "students"
+    log.info("build_backside_pdf_file_vector: %d %s (backside only), template=%s, chunk_pages=%d",
+             len(students), _kind, template_key, CHUNK_PAGES)
+
+    n_pages = (len(students) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE
+    tmp_dir = _resolve_pdf_tmp_dir()
+
+    tmp_final = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=tmp_dir)
+    tmp_final.close()
+    out_path = tmp_final.name
+
+    chunk_paths = []
+    chunk_doc = fitz.open()
+    pages_in_chunk = 0
+
+    def _flush_chunk():
+        nonlocal chunk_doc, pages_in_chunk
+        if pages_in_chunk == 0:
+            chunk_doc.close()
+            chunk_doc = fitz.open()
+            return
+        cp = tempfile.NamedTemporaryFile(delete=False, suffix=".chunk.pdf", dir=tmp_dir)
+        cp.close()
+        try:
+            _safe_save(chunk_doc, cp.name)
+            chunk_paths.append(cp.name)
+        finally:
+            chunk_doc.close()
+            chunk_doc = fitz.open()
+            pages_in_chunk = 0
+            gc.collect()
+
+    try:
+        for page_idx in range(n_pages):
+            # Render backside page only
+            student_start = page_idx * CARDS_PER_PAGE
+            num_cards = min(CARDS_PER_PAGE, len(students) - student_start)
+            _render_backside_page(chunk_doc, page_idx, num_cards, template_key, students)
+            pages_in_chunk += 1
+            
+            if pages_in_chunk >= CHUNK_PAGES:
+                _flush_chunk()
+            if progress_cb:
+                try: progress_cb(page_idx + 1, n_pages)
+                except Exception: pass
+
+        if pages_in_chunk > 0:
+            _flush_chunk()
+        else:
+            chunk_doc.close()
+
+        # Merge Chunks
+        merger = fitz.open()
+        for idx, cp in enumerate(chunk_paths):
+            c_doc = fitz.open(cp)
+            merger.insert_pdf(c_doc)
+            c_doc.close()
+            os.unlink(cp)
+            gc.collect()
+
+        _safe_save(merger, out_path)
+        merger.close()
+        return out_path
+    except Exception as e:
+        log.error("build_backside_pdf_file_vector FAILED: %s", e)
+        try:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        except Exception:
+            pass
+        return None
+
+
 def build_pdf_file_vector(students: list, template_key: str = DEFAULT_TEMPLATE,
                           progress_cb=None):
+    """Generate front-side only PDF. Use build_backside_pdf_file_vector for backside."""
     from src.renderers.base import (
         _resolve_card_renderer, _resolve_renderer_key,
         _ensure_template, _get_template_doc, normalize_template_key
@@ -405,7 +771,7 @@ def build_pdf_file_vector(students: list, template_key: str = DEFAULT_TEMPLATE,
         return None
 
     _kind = "employees" if str(template_key).endswith("_emp") else "students"
-    log.info("build_pdf_file_vector: %d %s, template=%s, chunk_pages=%d",
+    log.info("build_pdf_file_vector: %d %s (front only), template=%s, chunk_pages=%d",
              len(students), _kind, template_key, CHUNK_PAGES)
 
     source_rect = fitz.Rect(template_doc[0].rect)
@@ -443,12 +809,14 @@ def build_pdf_file_vector(students: list, template_key: str = DEFAULT_TEMPLATE,
 
     try:
         for page_idx in range(n_pages):
+            # Render front page only
             _render_a4_page(
                 chunk_doc, page_idx, students, template_key,
                 template_doc, source_rect, tmpl_bytes,
                 use_per_card, render_fn,
             )
             pages_in_chunk += 1
+            
             if pages_in_chunk >= CHUNK_PAGES:
                 _flush_chunk()
             if progress_cb:
@@ -543,6 +911,7 @@ def build_pdf_file_raster_fallback(students, dpi=150):
 
 
 def build_id_card_size_pdf(record: dict, template_key: str = DEFAULT_TEMPLATE, skip_flatten=False) -> str:
+    """Generate front-side only single card PDF. Use build_backside_id_card_size_pdf for backside."""
     from src.renderers.base import (
         _resolve_card_renderer, _ensure_template, _get_template_doc,
         draw_card_on_page, normalize_template_key
@@ -604,10 +973,51 @@ def build_id_card_size_pdf(record: dict, template_key: str = DEFAULT_TEMPLATE, s
         return None
 
 
-def build_pdf_file(students, dpi=150, template_key: str = DEFAULT_TEMPLATE):
+def build_backside_id_card_size_pdf(record: dict, template_key: str = DEFAULT_TEMPLATE, skip_flatten=False) -> str:
+    """Generate backside-only single card PDF."""
+    if not HAS_FITZ:
+        return None
+
+    template_key = normalize_template_key(template_key)
+    backside_doc = _get_backside_doc(template_key)
+    if not backside_doc or backside_doc.page_count == 0:
+        log.error("build_backside_id_card_size_pdf: backside template not found for '%s'", template_key)
+        return None
+
+    tmp_dir = _resolve_pdf_tmp_dir()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=tmp_dir)
+    tmp.close()
+    out_path = tmp.name
+
+    try:
+        out_doc = fitz.open()
+        back_page = out_doc.new_page(width=CARD_W_PT, height=CARD_H_PT)
+        back_page.show_pdf_page(fitz.Rect(0, 0, CARD_W_PT, CARD_H_PT), backside_doc, 0, keep_proportion=False)
+        try:
+            _safe_save(out_doc, out_path)
+        finally:
+            out_doc.close()
+        if not skip_flatten:
+            _pikepdf_downgrade_to_14(out_path)
+        return out_path
+    except Exception as e:
+        log.error("build_backside_id_card_size_pdf FAILED for '%s': %s",
+                  record.get("student_name") or record.get("employee_name", "?"), e)
+        try:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        except Exception:
+            pass
+        return None
+
+
+def build_pdf_file(students, dpi=150, template_key: str = DEFAULT_TEMPLATE, side="front"):
+    """Generate PDF for specified side: 'front' or 'back'."""
     from src.renderers.base import get_template_config
     template = get_template_config(template_key)
     if HAS_FITZ and template["pdf"].exists():
+        if side == "back":
+            return build_backside_pdf_file_vector(students, template_key=template["key"])
         return build_pdf_file_vector(students, template_key=template["key"])
     return build_pdf_file_raster_fallback(students, dpi=dpi)
 
@@ -647,7 +1057,7 @@ def _pdf_to_png_bytes(pdf_path: str, dpi: int = 600) -> bytes:
         return None
 
 
-def run_job(jid: str, students: list, template_key: str, download_name: str):
+def run_job(jid: str, students: list, template_key: str, download_name: str, side="front"):
     job_set(jid, status="running", phase="prefetch", started_at=time.time())
     try:
         try:
@@ -683,11 +1093,16 @@ def run_job(jid: str, students: list, template_key: str, download_name: str):
         job_set(jid, phase="render", progress=30.0)
 
         if HAS_FITZ:
-            out_path = build_pdf_file_vector(
-                students, template_key=template_key, progress_cb=_on_page,
-            )
+            if side == "back":
+                out_path = build_backside_pdf_file_vector(
+                    students, template_key=template_key, progress_cb=_on_page,
+                )
+            else:
+                out_path = build_pdf_file_vector(
+                    students, template_key=template_key, progress_cb=_on_page,
+                )
         else:
-            out_path = build_pdf_file(students, dpi=DOWNLOAD_DPI, template_key=template_key)
+            out_path = build_pdf_file(students, dpi=DOWNLOAD_DPI, template_key=template_key, side=side)
 
         if not out_path:
             raise RuntimeError("PDF build failed")
@@ -709,7 +1124,7 @@ def run_job(jid: str, students: list, template_key: str, download_name: str):
 
 def run_zip_job(jid: str, records: list, template_key: str, download_name: str,
                 name_field: str = "student_name", group_field: str = "class",
-                output_format: str = "pdf"):
+                output_format: str = "pdf", side="front"):
     job_set(jid, status="running", phase="prefetch", started_at=time.time())
     use_png = (output_format == "jpeg")
     try:
@@ -739,19 +1154,73 @@ def run_zip_job(jid: str, records: list, template_key: str, download_name: str,
         def _build_one(record):
             rname = (record.get(name_field) or "?").strip()
             try:
-                pdf_path = build_id_card_size_pdf(
-                    record, template_key=template_key,
-                    skip_flatten=use_png,
-                )
-                if not pdf_path or not Path(pdf_path).exists():
-                    log.warning("[zip-build] build_id_card_size_pdf returned no file for '%s'", rname)
-                    return None, None
                 if use_png:
-                    png_bytes = _pdf_to_png_bytes(pdf_path, dpi=600)
-                    try: Path(pdf_path).unlink(missing_ok=True)
-                    except Exception: pass
-                    return None, png_bytes
-                return pdf_path, None
+                    # Generate only the requested side
+                    if side == "front":
+                        pdf_path = build_id_card_size_pdf(
+                            record, template_key=template_key,
+                            skip_flatten=True,
+                        )
+                        if not pdf_path or not Path(pdf_path).exists():
+                            log.warning("[zip-build] build_id_card_size_pdf returned no file for '%s' (front)", rname)
+                            return None, None
+                        
+                        log.info("[zip-build] Converting front PDF to PNG for '%s': %s", rname, pdf_path)
+                        png_bytes = _pdf_to_png_bytes(pdf_path, dpi=600)
+                        
+                        if not png_bytes or len(png_bytes) == 0:
+                            log.error("[zip-build] PNG conversion failed for '%s' (front) - empty bytes", rname)
+                            try: Path(pdf_path).unlink(missing_ok=True)
+                            except Exception: pass
+                            return None, None
+                        
+                        log.info("[zip-build] Front PNG generated for '%s': %d bytes", rname, len(png_bytes))
+                        try: Path(pdf_path).unlink(missing_ok=True)
+                        except Exception: pass
+                        
+                        return png_bytes, None
+                    else:  # side == "back"
+                        backside_doc = _get_backside_doc(template_key)
+                        if not backside_doc or backside_doc.page_count == 0:
+                            log.warning("[zip-build] No backside template for '%s'", rname)
+                            return None, None
+                        
+                        tmp_dir_local = _resolve_pdf_tmp_dir()
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=tmp_dir_local)
+                        tmp.close()
+                        back_pdf_path = tmp.name
+                        try:
+                            back_doc = fitz.open()
+                            back_page = back_doc.new_page(width=CARD_W_PT, height=CARD_H_PT)
+                            back_page.show_pdf_page(fitz.Rect(0, 0, CARD_W_PT, CARD_H_PT), backside_doc, 0, keep_proportion=False)
+                            _safe_save(back_doc, back_pdf_path)
+                            back_doc.close()
+                            png_bytes = _pdf_to_png_bytes(back_pdf_path, dpi=600)
+                            log.info("[zip-build] Back PNG generated for '%s': %d bytes", rname, len(png_bytes) if png_bytes else 0)
+                            try: Path(back_pdf_path).unlink(missing_ok=True)
+                            except Exception: pass
+                            return png_bytes, None
+                        except Exception as e:
+                            log.error("[zip-build] backside PNG generation failed for '%s': %s", rname, e)
+                            try: Path(back_pdf_path).unlink(missing_ok=True)
+                            except Exception: pass
+                            return None, None
+                else:
+                    # PDF format: generate only the requested side
+                    if side == "front":
+                        pdf_path = build_id_card_size_pdf(
+                            record, template_key=template_key,
+                            skip_flatten=False,
+                        )
+                    else:  # side == "back"
+                        pdf_path = build_backside_id_card_size_pdf(
+                            record, template_key=template_key,
+                            skip_flatten=False,
+                        )
+                    if not pdf_path or not Path(pdf_path).exists():
+                        log.warning("[zip-build] build_id_card_size_pdf returned no file for '%s' (%s)", rname, side)
+                        return None, None
+                    return pdf_path, None
             except Exception as _exc:
                 log.error("[zip-build] _build_one EXCEPTION for '%s': %s", rname, _exc)
                 return None, None
@@ -779,22 +1248,32 @@ def run_zip_job(jid: str, records: list, template_key: str, download_name: str,
                 raw_name    = (record.get(name_field) or f"record_{idx+1}").strip()
                 group_label = (record.get(group_field) or "unknown").strip().upper()
                 safe        = re.sub(r"[^\w\-]", "_", raw_name)
-                ext         = "png" if use_png else "pdf"
-                base_name   = f"{group_label}_{safe}.{ext}"
-                if base_name in used_names:
-                    used_names[base_name] += 1
-                    base_name = f"{group_label}_{safe}_{used_names[base_name]}.{ext}"
-                else:
-                    used_names[base_name] = 1
-
+                
                 res = results[idx]
                 if res is None:
                     continue
-                pdf_path, png_bytes = res
+                pdf_path, png_data = res
+                
                 if use_png:
-                    if png_bytes:
-                        zf.writestr(base_name, png_bytes)
+                    # png_data is now single side bytes (not tuple)
+                    if png_data:
+                        side_name = f"{group_label}_{safe}_{side}.png"
+                        if side_name in used_names:
+                            used_names[side_name] += 1
+                            side_name = f"{group_label}_{safe}_{side}_{used_names[side_name]}.png"
+                        else:
+                            used_names[side_name] = 1
+                        zf.writestr(side_name, png_data)
                 else:
+                    # PDF format: single file with one side only
+                    ext = "pdf"
+                    base_name = f"{group_label}_{safe}_{side}.{ext}"
+                    if base_name in used_names:
+                        used_names[base_name] += 1
+                        base_name = f"{group_label}_{safe}_{side}_{used_names[base_name]}.{ext}"
+                    else:
+                        used_names[base_name] = 1
+                    
                     if pdf_path and Path(pdf_path).exists():
                         zf.write(pdf_path, arcname=base_name)
                         try: Path(pdf_path).unlink(missing_ok=True)

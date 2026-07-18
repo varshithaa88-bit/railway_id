@@ -1,7 +1,10 @@
 import os
 import multiprocessing as _mp
 import tempfile
+import logging
 from pathlib import Path
+
+log = logging.getLogger("idcard.config")
 
 # Paths
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -41,12 +44,23 @@ TEMPLATE_PDF_REDEEMER_EMP  = BASE_DIR / "template_redeemer_emp.pdf"
 TEMPLATE_PDF_PRIYANKA_EMP  = BASE_DIR / "template_priyanka_emp.pdf"
 TEMPLATE_PDF_AB_ASCENT_EMP = BASE_DIR / "template_ab_ascent_emp.pdf"
 
+# Backside Templates
+BACKSIDE_PDF_HEBRON    = BASE_DIR / "hebron_backside.pdf"
+BACKSIDE_PDF_REDEEMER  = BASE_DIR / "redeemer_backside.pdf"
+BACKSIDE_PDF_PRIYANKA  = BASE_DIR / "priyanka_backside.pdf"
+BACKSIDE_PDF_AB_ASCENT = BASE_DIR / "ab_ascent_backside.pdf"
+BACKSIDE_PDF_JNANABHARATI = BASE_DIR / "jnanabharati_backside.pdf"
+BACKSIDE_PDF_SCHOOL    = BASE_DIR / "school_backside.pdf"
+BACKSIDE_PDF_EMPLOYEE  = BASE_DIR / "employee_backside.pdf"
+BACKSIDE_PDF_STAFF     = BASE_DIR / "staff_backside.pdf"
+
 TEMPLATE_CONFIGS = {
     "hebron": {
         "key": "hebron",
         "label": "Hebron",
         "display_name": "Hebron Mission School",
         "pdf": TEMPLATE_PDF_HEBRON,
+        "renderer": "hebron",
         "description": "Red Hebron layout with section, roll, mother name and blood group.",
         "fields": [
             "student_name", "class", "section", "roll", "father_name",
@@ -59,6 +73,7 @@ TEMPLATE_CONFIGS = {
         "label": "Redeemer",
         "display_name": "My Redeemer Mission School",
         "pdf": TEMPLATE_PDF_REDEEMER,
+        "renderer": "redeemer",
         "description": "Blue Redeemer layout with father name, DOB, mobile and address.",
         "fields": [
             "student_name", "class", "father_name", "dob", "address",
@@ -70,6 +85,7 @@ TEMPLATE_CONFIGS = {
         "label": "Priyanka",
         "display_name": "Priyanka Dreamnest School",
         "pdf": TEMPLATE_PDF_PRIYANKA,
+        "renderer": "priyanka",
         "description": "Priyanka Dreamnest School ID layout.",
         "fields": [
             "student_name", "class", "father_name", "dob", "address",
@@ -81,6 +97,7 @@ TEMPLATE_CONFIGS = {
         "label": "Ab Ascent",
         "display_name": "Ab Ascent School",
         "pdf": TEMPLATE_PDF_AB_ASCENT,
+        "renderer": "ab_ascent",
         "description": "Ab Ascent School ID layout.",
         "fields": [
             "student_name", "class", "father_name", "dob", "address",
@@ -92,6 +109,7 @@ TEMPLATE_CONFIGS = {
         "label":        "Jnanabharati",
         "display_name": "Jnanabharati English School",
         "pdf":          TEMPLATE_PDF_JNANABHARATI,
+        "renderer":     "jnanabharati",
         "description":  "Jnanabharati English School student ID layout.",
         "fields": [
             "student_name", "class", "father_name", "mother_name", "dob",
@@ -153,6 +171,52 @@ EMPLOYEE_TEMPLATE_CONFIGS = {
 
 TEMPLATE_CONFIGS.update(EMPLOYEE_TEMPLATE_CONFIGS)
 EMPLOYEE_TEMPLATE_KEYS = set(EMPLOYEE_TEMPLATE_CONFIGS.keys())
+
+# Backside Template Configuration
+BACKSIDE_TEMPLATE_CONFIGS = {
+    "hebron": BACKSIDE_PDF_HEBRON,
+    "redeemer": BACKSIDE_PDF_REDEEMER,
+    "priyanka": BACKSIDE_PDF_PRIYANKA,
+    "ab_ascent": BACKSIDE_PDF_AB_ASCENT,
+    "jnanabharati": BACKSIDE_PDF_JNANABHARATI,
+    "school": BACKSIDE_PDF_SCHOOL,
+    "employee": BACKSIDE_PDF_EMPLOYEE,
+    "staff": BACKSIDE_PDF_STAFF,
+}
+
+def get_backside_template(template_key: str):
+    """Get the backside template PDF path for a given template key."""
+    key = str(template_key or "").strip().lower()
+    
+    log.info(f"[backside-config] Input template_key: '{template_key}', Normalized key: '{key}'")
+    
+    # Handle employee template keys (e.g., "hebron_emp" -> "hebron")
+    if key.endswith("_emp"):
+        key = key.replace("_emp", "")
+        log.info(f"[backside-config] Removed _emp suffix, key now: '{key}'")
+    
+    # Map to base template key
+    template_mapping = {
+        "hebron_emp": "hebron",
+        "redeemer_emp": "redeemer",
+        "priyanka_emp": "priyanka",
+        "ab_ascent_emp": "ab_ascent",
+    }
+    
+    if key in template_mapping:
+        key = template_mapping[key]
+        log.info(f"[backside-config] Mapped via template_mapping, key now: '{key}'")
+    
+    template_path = BACKSIDE_TEMPLATE_CONFIGS.get(key)
+    log.info(f"[backside-config] Template path from config: '{template_path}', Exists: {template_path.exists() if template_path else False}")
+    
+    # Fallback to redeemer backside if specific template doesn't exist
+    if template_path and not template_path.exists():
+        log.warning(f"Backside template not found for '{key}': {template_path}, falling back to redeemer")
+        template_path = BACKSIDE_TEMPLATE_CONFIGS.get("redeemer")
+        log.info(f"[backside-config] Fallback path: '{template_path}', Exists: {template_path.exists() if template_path else False}")
+    
+    return template_path
 
 API_BASE_URL = "https://titusattendence.com/apikey/apistudents?school_id={school_id}"
 
