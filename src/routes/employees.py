@@ -500,9 +500,9 @@ def emp_download_one():
     output_format = request.args.get("format", "pdf").strip().lower()
     if output_format in ("png", "jpeg", "jpg"):
         if side == "front":
-            pdf_path = build_id_card_size_pdf(emp, template_key=template_key, skip_flatten=False)
+            pdf_path = build_id_card_size_pdf(emp, template_key=template_key, skip_flatten=True)
         else:
-            pdf_path = build_backside_id_card_size_pdf(emp, template_key=template_key, skip_flatten=False)
+            pdf_path = build_backside_id_card_size_pdf(emp, template_key=template_key, skip_flatten=True)
         if not pdf_path:
             return jsonify({"error": "PDF generation failed"}), 500
         try:
@@ -520,12 +520,44 @@ def emp_download_one():
             log.error("PNG download error: %s", e)
             return jsonify({"error": f"PNG generation failed: {e}"}), 500
     
-    return send_generated_pdf(
-        [emp], dpi=DOWNLOAD_DPI,
-        download_name=f"{school_slug}_employee_{_safe_slug(safe_name)}_{side}.pdf",
-        as_attachment=True, allow_external=True,
-        template_key=template_key, side=side,
+    # For individual card downloads, skip PDF downgrade to avoid corruption
+    if side == "front":
+        pdf_path = build_id_card_size_pdf(emp, template_key=template_key, skip_flatten=True)
+    else:
+        pdf_path = build_backside_id_card_size_pdf(emp, template_key=template_key, skip_flatten=True)
+    
+    if not pdf_path:
+        return jsonify({"error": "PDF generation failed"}), 500
+    
+    try:
+        with open(pdf_path, "rb") as fh:
+            pdf_bytes = fh.read()
+    except OSError as e:
+        log.error("Could not read individual card PDF file: %s", e)
+        try:
+            Path(pdf_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return jsonify({"error": "PDF file missing after generation"}), 500
+    
+    # Clean up the temp file immediately after reading
+    try:
+        Path(pdf_path).unlink(missing_ok=True)
+    except Exception:
+        pass
+    
+    safe_name = _sanitize_filename(f"{school_slug}_employee_{_safe_slug(safe_name)}_{side}.pdf")
+    disp = f'attachment; filename="{safe_name}"'
+    resp = Response(
+        pdf_bytes,
+        status=200,
+        mimetype="application/pdf",
     )
+    resp.headers["Content-Disposition"] = disp
+    resp.headers["Content-Length"] = str(len(pdf_bytes))
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @employees_bp.route("/api/employees/download/backside/student", methods=["GET"])
@@ -550,7 +582,7 @@ def emp_download_backside_one():
     # Check if PNG format requested
     output_format = request.args.get("format", "pdf").strip().lower()
     if output_format in ("png", "jpeg", "jpg"):
-        pdf_path = build_backside_id_card_size_pdf(emp, template_key=template_key, skip_flatten=False)
+        pdf_path = build_backside_id_card_size_pdf(emp, template_key=template_key, skip_flatten=True)
         if not pdf_path:
             return jsonify({"error": "PDF generation failed"}), 500
         try:
@@ -568,12 +600,41 @@ def emp_download_backside_one():
             log.error("PNG download error: %s", e)
             return jsonify({"error": f"PNG generation failed: {e}"}), 500
     
-    return send_generated_pdf(
-        [emp], dpi=DOWNLOAD_DPI,
-        download_name=f"{school_slug}_employee_{_safe_slug(safe_name)}_back.pdf",
-        as_attachment=True, allow_external=True,
-        template_key=template_key, side="back",
+    # For individual card downloads, skip PDF downgrade to avoid corruption
+    pdf_path = build_backside_id_card_size_pdf(emp, template_key=template_key, skip_flatten=True)
+    
+    if not pdf_path:
+        return jsonify({"error": "PDF generation failed"}), 500
+    
+    try:
+        with open(pdf_path, "rb") as fh:
+            pdf_bytes = fh.read()
+    except OSError as e:
+        log.error("Could not read individual card PDF file: %s", e)
+        try:
+            Path(pdf_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return jsonify({"error": "PDF file missing after generation"}), 500
+    
+    # Clean up the temp file immediately after reading
+    try:
+        Path(pdf_path).unlink(missing_ok=True)
+    except Exception:
+        pass
+    
+    safe_name = _sanitize_filename(f"{school_slug}_employee_{_safe_slug(safe_name)}_back.pdf")
+    disp = f'attachment; filename="{safe_name}"'
+    resp = Response(
+        pdf_bytes,
+        status=200,
+        mimetype="application/pdf",
     )
+    resp.headers["Content-Disposition"] = disp
+    resp.headers["Content-Length"] = str(len(pdf_bytes))
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @employees_bp.route("/api/employees/download/zip", methods=["GET"])
