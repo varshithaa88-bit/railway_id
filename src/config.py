@@ -101,7 +101,7 @@ TEMPLATE_CONFIGS = {
         "description": "Ab Ascent School ID layout.",
         "fields": [
             "student_name", "class", "father_name", "dob", "address",
-            "mobile", "session", "photo_url", "adm_no",
+            "mobile", "session", "photo_url", "adm_no", "bus_route",
         ],
     },
     "jnanabharati": {
