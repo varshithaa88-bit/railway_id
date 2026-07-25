@@ -25,6 +25,12 @@ def _render_ab_ascent_card_bytes(student: dict, tmpl_bytes: bytes):
     WHITE_C = (1.0, 1.0, 1.0)
     BLACK   = (0.0, 0.0, 0.0)
 
+    # Check if bus is "other" to determine redaction zones
+    bus_upper = clean_card_value(student.get("bus_route", "")).upper().strip()
+    is_other = bus_upper in ("OTHER", "NONE", "NA", "N/A", "SELF")
+    
+    # Never redact the bus section - keep template bus symbols visible
+    # Only redact the white bar area where text will be overlaid (left side, avoiding bus icon)
     redact_zones = [
         (109.15, 107.50, 148.0,  118.50),
         ( 25.07, 107.50,  50.0,  118.50),
@@ -38,9 +44,12 @@ def _render_ab_ascent_card_bytes(student: dict, tmpl_bytes: bytes):
         ( 60.74, 175.60, 150.0,  184.10),
         ( 60.74, 183.60, 150.0,  192.00),
         ( 60.74, 191.10, 150.0,  199.60),
-        (  8.00, 203.60,  65.0,  211.60),
         (116.03,  84.50, 125.56,  94.00),
     ]
+    
+    # Only redact white bar area for text overlay (avoiding bus symbols)
+    redact_zones.append((30.0, 203.60, 65.0, 211.60))
+    
     for x0, y0, x1, y1 in redact_zones:
         page.add_redact_annot(fitz.Rect(x0, y0, x1, y1), fill=None)
     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
@@ -128,29 +137,8 @@ def _render_ab_ascent_card_bytes(student: dict, tmpl_bytes: bytes):
 
     bus = clean_card_value(student.get("bus_route", ""))
     if bus:
-        # Extract digits from the bus route string
-        import re
-        m = re.search(r"(BUS|VAN|ROUTE)?\s*(\d+)", bus, re.IGNORECASE)
-        if m:
-            label = m.group(1) or "BUS"
-            num = m.group(2)
-        else:
-            label = "BUS"
-            num = "".join(c for c in bus if c.isdigit()) or bus
-
-        # Print the number inside the original box position (9.0, 203.5, 17.5, 211.5)
-        box_w = 17.5 - 9.0
-        fs_num = _fit_size(bold_obj, num, box_w - 1.0, 6.0, 3.5)
-        tw_num = bold_obj.text_length(num, fontsize=fs_num)
-        bx = 9.0 + (box_w - tw_num) / 2.0
-        by = _centered_baseline_for_box(bold_obj, 203.5, 211.5, fs_num)
-        page.insert_text((bx, by), num,
-                         fontname=fn_bold, fontfile=bold_fn,
-                         fontsize=fs_num, color=NAVY, overlay=True)
-
-        # Print the label next to it starting at x=21.0
-        label_text = f"{label.upper()} {num}"
-        put(label_text, 21.0, 210.70, BLACK, 65.0, sz=5.5)
+        # Print the raw API value directly (BUS-3, BUS-2, BUS-1, SELF, OTHER)
+        put(bus, 30.0, 210.70, BLACK, 65.0, sz=5.5)
 
     addr = clean_card_value(student.get("address", ""))
     if addr:
