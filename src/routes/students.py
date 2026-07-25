@@ -219,7 +219,7 @@ def parse_file(file_path, filename):
             "blood_group":  pick(rm,"blood_group","bloodgroup","blood"),
             "gender":       pick(rm,"gender","sex"),
             "session":      pick(rm,"session",default=DEFAULT_SESSION),
-            "bus_route":    pick(rm,"bus_route","bus","bus_no","bus_number","route"),
+            "bus_route":    pick(rm,"bus_route","bus","bus_no","bus_number","route","select_vehicle"),
         }
         if any(s.values()):
             students.append(_post_clean_student(s))
@@ -244,7 +244,7 @@ _API_MAP = {
     "session":"session", "academic_year":"session",
     "gender":"gender", "sex":"gender",
     "bus_route":"bus_route", "bus":"bus_route", "bus_no":"bus_route",
-    "bus_number":"bus_route", "route":"bus_route",
+    "bus_number":"bus_route", "route":"bus_route", "select_vehicle":"bus_route",
 }
 _MAP_DEBUG_LOGGED = False
 
@@ -256,6 +256,23 @@ def map_api_record(record):
         "adm_no":"","blood_group":"","gender":"","session":DEFAULT_SESSION,
         "bus_route":"",
     }
+    
+    # Debug logging for select_vehicle field
+    if "select_vehicle" in record:
+        log.info(f"[API-MAP] Found select_vehicle in API record: {record['select_vehicle']}")
+    
+    for api_key, internal_key in _API_MAP.items():
+        if api_key in record:
+            val = record[api_key]
+            if val is not None and str(val).strip() not in {"nan", "none", "null", ""}:
+                out[internal_key] = str(val).strip()
+                if internal_key == "bus_route":
+                    log.info(f"[API-MAP] Mapped {api_key}={val} to bus_route")
+    
+    if not _MAP_DEBUG_LOGGED:
+        log.info("[API-MAP] Mapping keys: %s", list(_API_MAP.keys()))
+        _MAP_DEBUG_LOGGED = True
+    
     unmapped_keys = []
     for k, v in record.items():
         internal = _API_MAP.get(k.strip().lower())
