@@ -148,8 +148,10 @@ def clean_card_value(text):
         return ""
     if has_html(text):
         return ""
-    digits_only = re.sub(r"[0\-/:\. ]", "", text)
-    if not digits_only and re.search(r"[1-9]", text) is None:
+    # Allow single digits and short values - don't filter them out
+    # Only return empty if text is truly invalid (no meaningful content)
+    stripped = text.strip()
+    if not stripped:
         return ""
     return text
 

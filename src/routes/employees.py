@@ -13,10 +13,12 @@ from collections import defaultdict
 
 from flask import Blueprint, request, jsonify, send_file, Response
 import pandas as pd
+import requests
 
 from src.config import (
     DEFAULT_SESSION, DEFAULT_EMP_TEMPLATE, EMPLOYEE_TEMPLATE_CONFIGS, TEMPLATE_CONFIGS,
-    EMPLOYEE_TEMPLATE_KEYS, TEMPLATE_BRAND_COLORS, PREVIEW_DPI, DOWNLOAD_DPI
+    EMPLOYEE_TEMPLATE_KEYS, TEMPLATE_BRAND_COLORS, PREVIEW_DPI, DOWNLOAD_DPI,
+    EMPLOYEE_API_URLS, SCHOOLS, API_BASE_URL
 )
 from src.utils.text import clean_card_value
 from src.utils.photo import prefetch_photos, fetch_photo_bytes, prepare_photo_for_rect_cover, insert_image_safe
@@ -63,6 +65,18 @@ _EMP_COL_ALIASES = {
     "validity":      ("validity", "valid_till", "valid_upto", "expiry"),
     "photo_url":     ("photo_url", "photo", "image", "image_url",
                       "employee_photo", "emp_photo"),
+}
+
+# API field mapping for employee API response
+_EMP_API_FIELD_MAPPING = {
+    "name": "employee_name",
+    "designation": "designation",
+    "husband_name": "father_name",  # API uses husband_name for father_name
+    "dob": "dob",
+    "address": "address",
+    "contact": "mobile",  # API uses contact for mobile
+    "id": "emp_id",  # API uses id for emp_id
+    "employee_photo": "photo_url",
 }
 
 
@@ -204,6 +218,93 @@ def _emp_get_loaded_or_400():
     if not employees:
         return [], jsonify({"error": "No employees loaded. Please upload an Excel file."})
     return employees, None
+
+
+def map_api_employee_row(api_data: dict) -> dict:
+    """Map API employee data to internal format."""
+    # Map API fields to internal field names
+    mapped = {}
+    for api_field, internal_field in _EMP_API_FIELD_MAPPING.items():
+        if api_field in api_data:
+            mapped[internal_field] = api_data[api_field]
+    
+    # Use existing map_employee_row for final processing
+    return map_employee_row(mapped)
+
+
+@employees_bp.route("/api/employees/fetch-school/<int:school_id>", methods=["GET", "OPTIONS"])
+def fetch_employees_from_api(school_id: int):
+    """Fetch employees from API for a specific school."""
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+    
+    # Check if school has employee API
+    if school_id not in EMPLOYEE_API_URLS:
+        school_name = SCHOOLS.get(school_id, f"School {school_id}")
+        return jsonify({
+            "error": f"Employee API not available for {school_name}. Please upload employee data via Excel/CSV file.",
+            "school_id": school_id,
+            "school_name": school_name,
+            "api_available": False
+        }), 400
+    
+    api_url = EMPLOYEE_API_URLS[school_id]
+    school_name = SCHOOLS.get(school_id, f"School {school_id}")
+    
+    log.info("[fetch-employees] school_id=%d URL=%s", school_id, api_url)
+    
+    try:
+        response = requests.get(api_url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get("status") != "success":
+            return jsonify({"error": "API returned unsuccessful status"}), 400
+        
+        employees_data = data.get("data", [])
+        if not employees_data:
+            return jsonify({"error": "No employee data found in API response"}), 400
+        
+        # Map API data to internal format
+        employees = []
+        for emp_data in employees_data:
+            mapped_emp = map_api_employee_row(emp_data)
+            if mapped_emp.get("employee_name") or mapped_emp.get("emp_id"):
+                employees.append(mapped_emp)
+        
+        # Sort employees
+        employees.sort(key=lambda e: (
+            (e.get("designation") or "").strip().upper(),
+            (e.get("employee_name") or "").strip().upper(),
+        ))
+        
+        # Add serial numbers
+        for i, e in enumerate(employees, 1):
+            e["serial"] = i
+        
+        # Update store
+        replace_emp_store(employees, "api", school_name)
+        
+        log.info("[fetch-employees] Loaded %d employees from API for %s", len(employees), school_name)
+        
+        return jsonify({
+            "success": True,
+            "count": len(employees),
+            "school_id": school_id,
+            "school_name": school_name,
+            "source": "api",
+            "classes": _employee_groups_summary(employees),
+            "session": DEFAULT_SESSION,
+        })
+        
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "API request timed out"}), 504
+    except requests.exceptions.RequestException as e:
+        log.error("[fetch-employees] API request failed: %s", e)
+        return jsonify({"error": f"API request failed: {str(e)}"}), 500
+    except Exception as e:
+        log.error("[fetch-employees] Unexpected error: %s", e)
+        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
 
 @employees_bp.route("/api/employees/templates", methods=["GET"])

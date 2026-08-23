@@ -14,6 +14,12 @@ TEMPLATE_PDF_PRIYANKA  = BASE_DIR / "template_priyanka.pdf"
 TEMPLATE_PDF_AB_ASCENT = BASE_DIR / "template_ab_ascent.pdf"
 TEMPLATE_PDF_JNANABHARATI = BASE_DIR / "JNANABHARATI_student.pdf"
 
+# Podar School Templates
+TEMPLATE_PDF_PODAR_PLAY_GROUP = BASE_DIR / "smart_cards/play_group_podar.pdf"
+TEMPLATE_PDF_PODAR_NURSERY = BASE_DIR / "smart_cards/nursery_podar.pdf"
+TEMPLATE_PDF_PODAR_JUNIOR_KG = BASE_DIR / "smart_cards/junior_kg_podar.pdf"
+TEMPLATE_PDF_PODAR_SENIOR_KG = BASE_DIR / "smart_cards/senior_kg_podar.pdf"
+
 ANTON_FONT             = BASE_DIR / "Anton-Regular.ttf"
 ARIAL_BOLD             = BASE_DIR / "arialbd.ttf"
 
@@ -37,6 +43,14 @@ SCHOOLS = {
     4: "Priyanka Dreamnest School",
     5: "Ab Ascent School",
     6: "Jnanabharati English School",
+    7: "Podar School",
+}
+
+# Employee API URLs
+EMPLOYEE_API_URLS = {
+    3: "https://titusattendence.com/apikey/apistaff?school_id=3",  # Hebron
+    4: "https://titusattendence.com/apikey/apistaff?school_id=4",  # Priyanka
+    5: "https://titusattendence.com/apikey/apistaff?school_id=5",  # AB Ascent
 }
 
 TEMPLATE_PDF_HEBRON_EMP    = BASE_DIR / "template_hebron_emp.pdf"
@@ -116,6 +130,34 @@ TEMPLATE_CONFIGS = {
             "adm_no", "blood_group", "photo_url",
         ],
     },
+    "podar": {
+        "key": "podar",
+        "label": "Podar",
+        "display_name": "Podar School",
+        "pdf": TEMPLATE_PDF_PODAR_PLAY_GROUP,  # Default, will be overridden by class
+        "renderer": "podar",
+        "description": "Podar School ID layout with class-specific templates.",
+        "fields": [
+            "student_name", "class", "section", "address", "father_contact",
+            "blood_group", "mode_of_transport", "photo_url",
+        ],
+        "class_templates": {
+            "Play Group": TEMPLATE_PDF_PODAR_PLAY_GROUP,
+            "Nursery": TEMPLATE_PDF_PODAR_NURSERY,
+            "Junior KG": TEMPLATE_PDF_PODAR_JUNIOR_KG,
+            "Senior KG": TEMPLATE_PDF_PODAR_SENIOR_KG,
+        },
+        "api_url": "https://titusattendence.com/apikey/apistudents?school_id=7",
+        "card_dimensions": {
+            "width_mm": 86,
+            "height_mm": 54,
+            "page_width_mm": 297,
+            "page_height_mm": 210,
+            "cards_per_row": 3,
+            "rows_per_page": 3,
+            "cards_per_page": 9,
+        },
+    },
 }
 
 EMPLOYEE_TEMPLATE_CONFIGS = {
@@ -130,6 +172,7 @@ EMPLOYEE_TEMPLATE_CONFIGS = {
             "employee_name", "designation", "father_name", "dob",
             "address", "mobile", "emp_id", "photo_url",
         ],
+        "school_id": 3,
     },
     "redeemer_emp": {
         "key":          "redeemer_emp",
@@ -142,6 +185,7 @@ EMPLOYEE_TEMPLATE_CONFIGS = {
             "employee_name", "designation", "father_name", "dob",
             "address", "mobile", "emp_id", "photo_url",
         ],
+        "school_id": 2,
     },
     "priyanka_emp": {
         "key":          "priyanka_emp",
@@ -154,6 +198,7 @@ EMPLOYEE_TEMPLATE_CONFIGS = {
             "employee_name", "designation", "father_name", "dob",
             "address", "mobile", "emp_id", "photo_url",
         ],
+        "school_id": 4,
     },
     "ab_ascent_emp": {
         "key":          "ab_ascent_emp",
@@ -166,6 +211,7 @@ EMPLOYEE_TEMPLATE_CONFIGS = {
             "employee_name", "designation", "father_name", "dob",
             "address", "mobile", "emp_id", "validity", "photo_url",
         ],
+        "school_id": 5,
     },
 }
 
@@ -257,17 +303,30 @@ CHUNK_PAGES = 50
 MERGE_COMPACT_PAGES = 500
 MAX_CACHED_PHOTOS = 2000
 
-# Physical Card Layout Dimensions
+# Physical Card Layout Dimensions (default for most schools)
 CARD_W_MM = 55.0
 CARD_H_MM = 86.0
 A4_W_MM = 297.0
 A4_H_MM = 210.0
+
+# Podar Card Dimensions (86×54 mm landscape)
+PODAR_CARD_W_MM = 86.0
+PODAR_CARD_H_MM = 54.0
+
+# Standard Layout (5×2 grid for most schools)
 COLS = 5
 ROWS = 2
 CARDS_PER_PAGE = 10
 ROW_GAP_MM = 10.0
 OFFSET_X_MM = 11.0
 OFFSET_Y_MM = 14.0
+
+# Podar Layout (3×3 grid for Podar school)
+PODAR_COLS = 3
+PODAR_ROWS = 3
+PODAR_CARDS_PER_PAGE = 9
+PODAR_ROW_GAP_MM = 14.0
+PODAR_COL_GAP_MM = 10.0
 
 MM_TO_PT = 2.834645669291339
 PT_PER_INCH = 72.0
@@ -277,12 +336,30 @@ CARD_H_PT = CARD_H_MM * MM_TO_PT
 A4_W_PT = A4_W_MM * MM_TO_PT
 A4_H_PT = A4_H_MM * MM_TO_PT
 
-OX_PT = 31.181102362204726
-OY_PT = 39.68503937007874
-ROW_GAP_PT = 28.34645669291339
+# Podar card dimensions in points
+PODAR_CARD_W_PT = PODAR_CARD_W_MM * MM_TO_PT
+PODAR_CARD_H_PT = PODAR_CARD_H_MM * MM_TO_PT
+
+# Standard layout calculations
+OX_PT = OFFSET_X_MM * MM_TO_PT
+OY_PT = OFFSET_Y_MM * MM_TO_PT
+ROW_STEP = CARD_H_PT + ROW_GAP_MM * MM_TO_PT
+COL_STEP = CARD_W_PT + (A4_W_PT - COLS * CARD_W_PT) / (COLS - 1) if COLS > 1 else 0
+ROW_GAP_PT = ROW_GAP_MM * MM_TO_PT
+
+# Podar layout calculations (3×3 grid centered on A4 landscape)
+PODAR_TOTAL_W = PODAR_COLS * PODAR_CARD_W_MM + (PODAR_COLS - 1) * PODAR_COL_GAP_MM
+PODAR_TOTAL_H = PODAR_ROWS * PODAR_CARD_H_MM + (PODAR_ROWS - 1) * PODAR_ROW_GAP_MM
+PODAR_OFFSET_X_MM = (A4_W_MM - PODAR_TOTAL_W) / 2
+PODAR_OFFSET_Y_MM = (A4_H_MM - PODAR_TOTAL_H) / 2
+PODAR_OX_PT = PODAR_OFFSET_X_MM * MM_TO_PT
+PODAR_OY_PT = PODAR_OFFSET_Y_MM * MM_TO_PT
+PODAR_ROW_STEP = PODAR_CARD_H_PT + PODAR_ROW_GAP_MM * MM_TO_PT
+PODAR_COL_STEP = PODAR_CARD_W_PT + PODAR_COL_GAP_MM * MM_TO_PT
+ROW_GAP_PT = ROW_GAP_MM * MM_TO_PT
 COL_GAP_PT = 2.834645669291339
-COL_STEP = 158.740157480315
-ROW_STEP = 272.12598425196853
+COL_STEP = CARD_W_PT + (A4_W_PT - COLS * CARD_W_PT) / (COLS - 1) if COLS > 1 else 0
+ROW_STEP = CARD_H_PT + ROW_GAP_PT
 
 TEMPLATE_BRAND_COLORS = {
     'hebron': '#DC2626',

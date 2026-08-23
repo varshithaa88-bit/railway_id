@@ -35,7 +35,9 @@ from src.config import (
     OX_PT, OY_PT, COL_STEP, ROW_STEP, ROW_GAP_PT, COLS, ROWS, CARDS_PER_PAGE,
     PDF_TEMP_DIR, CARD_RENDER_WORKERS, ZIP_BUILD_WORKERS, PREFETCH_WORKERS,
     DOWNLOAD_DPI, CHUNK_PAGES, DEFAULT_TEMPLATE, MM_TO_PT,
-    TEMPLATE_CONFIGS, get_backside_template
+    TEMPLATE_CONFIGS, get_backside_template,
+    PODAR_CARD_W_PT, PODAR_CARD_H_PT, PODAR_OX_PT, PODAR_OY_PT,
+    PODAR_COL_STEP, PODAR_ROW_STEP, PODAR_COLS, PODAR_ROWS, PODAR_CARDS_PER_PAGE
 )
 
 from src.utils.text import ensure_fonts, clean_card_value
@@ -586,6 +588,59 @@ def _render_backside_page(out_doc, page_idx: int, num_cards: int, template_key: 
         log.error("Failed to render backside page for '%s': %s", template_key, e)
 
 
+def _render_podar_a4_page(out_doc, page_idx: int, students: list,
+                           template_key: str, tmpl_bytes: bytes, render_fn):
+    """Render Podar-specific A4 page with 86×54 mm cards in 3×3 grid layout."""
+    from src.renderers.podar import render_podar_student_card
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    student_start = page_idx * PODAR_CARDS_PER_PAGE
+    student_batch = students[student_start: student_start + PODAR_CARDS_PER_PAGE]
+    a4_page = out_doc.new_page(width=A4_W_PT, height=A4_H_PT)
+    
+    # Render cards with class-specific templates using parallel processing
+    batch_workers = min(CARD_RENDER_WORKERS, len(student_batch))
+    batch_rendered = [None] * len(student_batch)
+    
+    if batch_workers > 1:
+        with ThreadPoolExecutor(max_workers=batch_workers) as pool:
+            fut_map = {
+                pool.submit(render_podar_student_card, student_batch[i], student_batch[i].get("class", "Play Group")): i
+                for i in range(len(student_batch))
+            }
+            for f in as_completed(fut_map):
+                bi = fut_map[f]
+                try:
+                    batch_rendered[bi] = f.result()
+                except Exception as e:
+                    log.error("Podar card render FAILED student[%d]: %s", student_start + bi, e)
+                    batch_rendered[bi] = None
+    else:
+        # Sequential fallback
+        for i, student in enumerate(student_batch):
+            try:
+                class_name = student.get("class", "Play Group")
+                batch_rendered[i] = render_podar_student_card(student, class_name)
+            except Exception as e:
+                log.error("Podar card render FAILED student[%d]: %s", student_start + i, e)
+                batch_rendered[i] = None
+    
+    # Place cards in 3×3 grid
+    for idx, card_bytes in enumerate(batch_rendered):
+        if card_bytes:
+            col = idx % PODAR_COLS
+            row = idx // PODAR_COLS
+            card_x = PODAR_OX_PT + col * PODAR_COL_STEP
+            card_y = PODAR_OY_PT + row * PODAR_ROW_STEP
+            target_rect = fitz.Rect(card_x, card_y, card_x + PODAR_CARD_W_PT, card_y + PODAR_CARD_H_PT)
+            
+            card_doc = fitz.open("pdf", card_bytes)
+            a4_page.show_pdf_page(target_rect, card_doc, 0, keep_proportion=False, overlay=True)
+            card_doc.close()
+    
+    batch_rendered.clear()
+
+
 def _render_a4_page(out_doc, page_idx: int, students: list,
                     template_key: str, template_doc, source_rect,
                     tmpl_bytes: bytes, use_per_card: bool, render_fn):
@@ -748,17 +803,110 @@ def build_backside_pdf_file_vector(students: list, template_key: str = DEFAULT_T
         return None
 
 
+def build_podar_pdf_file_vector(students: list, template_key: str = "podar",
+                                progress_cb=None):
+    """Generate Podar-specific PDF with 86×54 mm cards in 3×3 grid layout."""
+    if not HAS_FITZ:
+        log.error("build_podar_pdf_file_vector: PyMuPDF not installed")
+        return None
+    
+    log.info("build_podar_pdf_file_vector: %d students, template=%s, chunk_pages=%d",
+             len(students), template_key, CHUNK_PAGES)
+
+    n_pages = (len(students) + PODAR_CARDS_PER_PAGE - 1) // PODAR_CARDS_PER_PAGE
+    tmp_dir = _resolve_pdf_tmp_dir()
+
+    tmp_final = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=tmp_dir)
+    tmp_final.close()
+    out_path = tmp_final.name
+
+    chunk_paths = []
+    chunk_doc = fitz.open()
+    pages_in_chunk = 0
+
+    def _flush_chunk():
+        nonlocal chunk_doc, pages_in_chunk
+        if pages_in_chunk == 0:
+            chunk_doc.close()
+            chunk_doc = fitz.open()
+            return
+        cp = tempfile.NamedTemporaryFile(delete=False, suffix=".chunk.pdf", dir=tmp_dir)
+        cp.close()
+        try:
+            _safe_save(chunk_doc, cp.name)
+            chunk_paths.append(cp.name)
+        finally:
+            chunk_doc.close()
+            chunk_doc = fitz.open()
+            pages_in_chunk = 0
+            gc.collect()
+
+    try:
+        for page_idx in range(n_pages):
+            _render_podar_a4_page(chunk_doc, page_idx, students, template_key, None, None)
+            pages_in_chunk += 1
+            
+            if progress_cb:
+                try: progress_cb(page_idx + 1, n_pages)
+                except Exception: pass
+            
+            if pages_in_chunk >= CHUNK_PAGES:
+                _flush_chunk()
+
+        if pages_in_chunk > 0:
+            _flush_chunk()
+
+        # Merge chunks
+        if chunk_paths:
+            final_doc = fitz.open()
+            for cp in chunk_paths:
+                try:
+                    chunk = fitz.open(cp)
+                    final_doc.insert_pdf(chunk)
+                    chunk.close()
+                    os.unlink(cp)
+                except Exception as e:
+                    log.error("Failed to merge chunk %s: %s", cp, e)
+            
+            _safe_save(final_doc, out_path)
+            final_doc.close()
+            chunk_doc.close()
+            log.info("Podar PDF generated: %s (%d pages)", out_path, n_pages)
+            return out_path
+        else:
+            chunk_doc.close()
+            return None
+
+    except Exception as e:
+        log.error("Podar PDF generation failed: %s", traceback.format_exc())
+        if chunk_doc:
+            chunk_doc.close()
+        if os.path.exists(out_path):
+            os.unlink(out_path)
+        for cp in chunk_paths:
+            if os.path.exists(cp):
+                os.unlink(cp)
+        return None
+
+
 def build_pdf_file_vector(students: list, template_key: str = DEFAULT_TEMPLATE,
-                          progress_cb=None):
-    """Generate front-side only PDF. Use build_backside_pdf_file_vector for backside."""
+                         progress_cb=None):
+    """Generate PDF using PyMuPDF vector rendering (no rasterization)."""
+    if not HAS_FITZ:
+        log.error("build_pdf_file_vector: PyMuPDF not installed")
+        return None
+    template_key = str(template_key).strip().lower()
+    
+    # Check if this is Podar - use Podar-specific rendering
+    if template_key == "podar":
+        return build_podar_pdf_file_vector(students, template_key, progress_cb)
+    
+    # Standard rendering for other schools
     from src.renderers.base import (
         _resolve_card_renderer, _resolve_renderer_key,
         _ensure_template, _get_template_doc, normalize_template_key
     )
 
-    if not HAS_FITZ:
-        log.error("build_pdf_file_vector: PyMuPDF not installed")
-        return None
     template_key = normalize_template_key(template_key)
     tmpl_bytes = _ensure_template(template_key)
     if tmpl_bytes is None:

@@ -246,10 +246,23 @@ _API_MAP = {
     "bus_route":"bus_route", "bus":"bus_route", "bus_no":"bus_route",
     "bus_number":"bus_route", "route":"bus_route", "select_vehicle":"bus_route",
 }
+
+# Podar-specific API mapping
+_PODAR_API_MAP = {
+    "student_name":"student_name",
+    "class_name":"class",
+    "section_id":"section",
+    "address":"address",
+    "father_contact":"mobile",
+    "blood_group":"blood_group",
+    "select_vehicle":"bus_route",
+    "student_photo":"photo_url",
+    "gender":"gender",
+}
+
 _MAP_DEBUG_LOGGED = False
 
-def map_api_record(record):
-    global _MAP_DEBUG_LOGGED
+def map_api_record(record, is_podar=False):
     out = {
         "student_name":"","class":"","section":"","roll":"","father_name":"",
         "mother_name":"","dob":"","address":"","mobile":"","photo_url":"",
@@ -257,11 +270,14 @@ def map_api_record(record):
         "bus_route":"",
     }
     
+    # Use Podar-specific mapping if indicated
+    mapping = _PODAR_API_MAP if is_podar else _API_MAP
+    
     # Debug logging for select_vehicle field
     if "select_vehicle" in record:
         log.info(f"[API-MAP] Found select_vehicle in API record: {record['select_vehicle']}")
     
-    for api_key, internal_key in _API_MAP.items():
+    for api_key, internal_key in mapping.items():
         if api_key in record:
             val = record[api_key]
             if val is not None and str(val).strip() not in {"nan", "none", "null", ""}:
@@ -332,17 +348,78 @@ def upload_file():
         return jsonify({
             "success": True,
             "count": len(students),
-            "school_name": "Uploaded File",
-            "classes": _classes_summary(students),
-            "session": students[0].get("session", DEFAULT_SESSION) if students else DEFAULT_SESSION,
         })
     except Exception as e:
-        log.error("Upload error: %s\n%s", e, traceback.format_exc())
-        return jsonify({"error": f"Could not parse file: {e}"}), 500
+        log.error("Upload error: %s", traceback.format_exc())
+        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            try: os.unlink(tmp_path)
-            except: pass
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+@students_bp.route("/api/podar/fetch", methods=["POST"])
+@students_bp.route("/podar/fetch", methods=["POST"])
+def fetch_podar_students():
+    """Fetch students from Podar API."""
+    from src.config import TEMPLATE_CONFIGS
+    
+    podar_config = TEMPLATE_CONFIGS.get("podar", {})
+    api_url = podar_config.get("api_url")
+    
+    if not api_url:
+        return jsonify({"error": "Podar API URL not configured"}), 500
+    
+    try:
+        response = requests.get(api_url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get("status") != "success":
+            return jsonify({"error": f"Podar API returned status: {data.get('status')}"}), 400
+        
+        students_data = data.get("data", [])
+        if not students_data:
+            return jsonify({"error": "Podar API returned no students"}), 400
+        
+        # Map Podar API records using Podar-specific mapping
+        mapped_students = []
+        for record in students_data:
+            # Handle photo URL (array or string)
+            photo_url = record.get("student_photo")
+            if isinstance(photo_url, list) and len(photo_url) > 0:
+                record["student_photo"] = photo_url[0]
+            elif not isinstance(photo_url, str):
+                record["student_photo"] = ""
+            
+            mapped = map_api_record(record, is_podar=True)
+            if mapped:
+                mapped_students.append(mapped)
+        
+        if not mapped_students:
+            return jsonify({"error": "No valid students after mapping"}), 400
+        
+        replace_store(mapped_students, "podar_api", "Podar API", school_id=7)
+        log.info("Podar API: %d students fetched", len(mapped_students))
+        
+        return jsonify({
+            "success": True,
+            "count": len(mapped_students),
+            "source": "Podar API",
+            "classes_summary": _classes_summary(mapped_students),
+        })
+        
+    except requests.exceptions.RequestException as e:
+        log.error("Podar API request failed: %s", str(e))
+        return jsonify({"error": f"Podar API request failed: {str(e)}"}), 500
+    except ValueError as e:
+        log.error("Podar API JSON error: %s", str(e))
+        return jsonify({"error": f"Podar API returned invalid JSON: {str(e)}"}), 500
+    except Exception as e:
+        log.error("Podar API processing error: %s", traceback.format_exc())
+        return jsonify({"error": f"Podar API processing failed: {str(e)}"}), 500
 
 
 @students_bp.route("/api/fetch-school/<int:school_id>", methods=["GET"])
@@ -582,8 +659,8 @@ def send_generated_pdf(students, dpi, download_name, as_attachment, allow_extern
     return resp
 
 
-@students_bp.route("/api/preview/all", methods=["GET"])
-@students_bp.route("/preview/all", methods=["GET"])
+@students_bp.route("/api/preview/all", methods=["GET", "POST", "OPTIONS"])
+@students_bp.route("/preview/all", methods=["GET", "POST", "OPTIONS"])
 def preview_all():
     template_key, err_resp, err_code = _request_template_key()
     if err_resp:
