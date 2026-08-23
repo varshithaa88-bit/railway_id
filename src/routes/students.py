@@ -263,6 +263,7 @@ _PODAR_API_MAP = {
 _MAP_DEBUG_LOGGED = False
 
 def map_api_record(record, is_podar=False):
+    global _MAP_DEBUG_LOGGED
     out = {
         "student_name":"","class":"","section":"","roll":"","father_name":"",
         "mother_name":"","dob":"","address":"","mobile":"","photo_url":"",
